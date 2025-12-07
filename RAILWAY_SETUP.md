@@ -26,6 +26,7 @@ Railway needs your secrets to run the bot.
     -   `OPAY_PRIVATE_KEY`
     -   `OPAY_API_BASE_URL` (set to `https://api.opay.com` or your specific URL)
     -   `NODE_ENV` (set to `production`)
+    -   `NIXPACKS_NODE_VERSION` (set to `20` if build fails)
 
 ## Step 3: Configure Persistent Storage (Crucial!)
 To avoid scanning the QR code every time you deploy, you need a **Volume**.
