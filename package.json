@@ -4,6 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
+    "start": "node server-simple.js",
     "dev": "node server-simple.js",
     "build": "tsc --noEmit",
     "lint": "eslint .",
