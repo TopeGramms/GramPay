@@ -136,6 +136,62 @@ export class OpayPaymentService {
     const cleaned = accountNumber.replace(/\D/g, '');
     return cleaned.length === 10;
   }
+
+  async handleWebhook(data, signature) {
+    try {
+      // 1. Verify signature
+      const calculatedSignature = this.generateSignature(data);
+
+      if (calculatedSignature !== signature) {
+        console.warn('⚠️ Invalid webhook signature:', { received: signature, calculated: calculatedSignature });
+        return { success: false, message: 'Invalid signature' };
+      }
+
+      console.log('✅ Webhook signature verified');
+
+      // 2. Process the payload
+      const { reference, orderNo, amount, status, statusDesc } = data;
+
+      // Map OPay status to our status
+      let transactionStatus = 'pending';
+      if (status === 'SUCCESS' || status === '00000') {
+        transactionStatus = 'completed';
+      } else if (status === 'FAILED') {
+        transactionStatus = 'failed';
+      }
+
+      // 3. Update transaction in database
+      const { data: transaction, error } = await supabase
+        .from('transactions')
+        .update({
+          status: transactionStatus,
+          opay_reference: orderNo || reference
+        })
+        .eq('opay_reference', reference)
+        .select()
+        .single();
+
+      if (error) {
+        // PGRST116 = no rows found, which is expected for test data
+        if (error.code === 'PGRST116') {
+          console.log('ℹ️ No matching transaction found for reference:', reference);
+          return { success: true, message: 'No matching transaction (webhook acknowledged)' };
+        }
+        console.error('Error updating transaction from webhook:', error);
+        return { success: false, message: 'Database update failed' };
+      }
+
+      return {
+        success: true,
+        message: 'Webhook processed',
+        data: transaction
+      };
+
+    } catch (error) {
+      console.error('Webhook processing error:', error);
+      return { success: false, message: error.message };
+    }
+  }
 }
 
 export class TransactionService {

@@ -1,4 +1,4 @@
-import { parseCommand } from './ai.js';
+import { parseCommand, generateConversationalResponse } from './ai.js';
 import { recipientService } from './recipients.js';
 import { opayService, transactionService } from './payments.js';
 import { whatsappService } from './whatsapp.js';
@@ -15,6 +15,12 @@ export class CommandHandler {
 
       const parsedCommand = await parseCommand(message);
 
+      // If action is unknown, use conversational AI instead of generic clarification
+      if (parsedCommand.action === 'unknown') {
+        return await generateConversationalResponse(message);
+      }
+
+      // For known actions that need clarification, use the AI's clarification message
       if (parsedCommand.clarificationNeeded) {
         return parsedCommand.clarificationMessage;
       }
@@ -44,8 +50,10 @@ export class CommandHandler {
         case 'help':
           return await this.handleHelp();
 
+        case 'unknown':
         default:
-          return this.getHelpMessage();
+          // Use conversational AI for unknown messages
+          return await generateConversationalResponse(message);
       }
     } catch (error) {
       console.error('Error handling command:', error);

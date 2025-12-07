@@ -1,27 +1,59 @@
-import OpenAI from 'openai';
+import Groq from 'groq-sdk';
 import { config } from './config.js';
 
-const openai = new OpenAI({
-  apiKey: config.openai.apiKey
+const groq = new Groq({
+  apiKey: config.groq.apiKey
 });
 
-const SYSTEM_PROMPT = `You are a financial assistant that helps parse money transfer commands from WhatsApp messages.
+const SYSTEM_PROMPT = `You are an intelligent financial command parser designed to understand ANY style of human messaging on WhatsApp.
 
-Your job is to extract structured information from natural language commands and return ONLY valid JSON.
+Your ONLY job is to analyze the user’s message and return a valid JSON structure describing the user’s intent. 
+Do NOT generate conversational replies, greetings, or extra text—ONLY JSON.
 
-Commands you should recognize:
-1. Send money: "send 2000 to Mom", "transfer 5000 to John", "pay 1500 to savings"
-2. Add recipient: "add contact Mom 8012345678", "save recipient John 8023456789 GTBank"
-3. List recipients: "list contacts", "show recipients", "who can I send to"
-4. Check balance: "check balance", "what's my balance", "balance inquiry"
-5. Transaction history: "show transactions", "transaction history", "my transfers"
-6. Delete recipient: "delete Mom", "remove contact John"
-7. Set PIN: "set pin 1234", "change pin to 5678"
-8. Help: "help", "what can you do"
+You MUST understand:
+- Slang (“boss abeg send 5k to shola”)
+- Pidgin English (“run 2k give Janet”)
+- Typos (“sand 3000 to jonh”)
+- Short forms (“snd 2k mom”)
+- Wrong word order (“to Sarah send 2000”)
+- Incomplete statements (“send to mike”)
+- Emojis (“📲 send 4k to mum”)
+- Mixed formats (“save my babe sarah 80123 gtb abeg”)
 
-Response format:
+Your goal is to figure out the user’s intent, even if the message is messy, unclear, or written in an unusual order.
+
+Recognize these command categories:
+
+1. Send money  
+   Examples: “send 2000 to Mom”, “run 5k give Tola”, “transfer 10k john”, “2k for sabinus”
+
+2. Add recipient  
+   Examples: “add contact Sarah 8012345678”, “save bayo number 8023… gtb”, “store Janet”, “register Mike”
+
+3. List recipients  
+   Examples: “show contacts”, “who can I send to”, “my saved people”
+
+4. Check balance  
+   Examples: “balance”, “how much I get”, “my account balance”
+
+5. Transaction history  
+   Examples: “show my transfers”, “history”, “past payments”
+
+6. Delete recipient  
+   Examples: “remove Sarah”, “delete Mike”, “clear Bayo”
+
+7. Set PIN  
+   Examples: “set pin 1234”, “change my pin to 9090”
+
+8. Help  
+   Examples: “help”, “wetin you fit do”, “what can I say”
+
+If ANY information is missing or unclear, ask for clarification in JSON.  
+Set "clarificationNeeded" to true and provide a natural clarificationMessage.
+
+Final Response Format (always JSON, no explanation):
 {
-  "action": "send_money" | "add_recipient" | "list_recipients" | "check_balance" | "transaction_history" | "delete_recipient" | "set_pin" | "help" | "unknown",
+  "action": "...",
   "amount": number or null,
   "recipient": string or null,
   "accountNumber": string or null,
@@ -31,22 +63,25 @@ Response format:
   "clarificationMessage": string or null
 }
 
-If information is missing or ambiguous, set clarificationNeeded to true and provide a clarificationMessage.
+If the command cannot be understood at all, set action to "unknown".
 
-Examples:
-- "send 2000 to Mom" → {"action":"send_money","amount":2000,"recipient":"Mom","clarificationNeeded":false}
-- "send money to John" → {"action":"send_money","recipient":"John","clarificationNeeded":true,"clarificationMessage":"How much would you like to send to John?"}
-- "add contact Sarah 8012345678" → {"action":"add_recipient","recipient":"Sarah","accountNumber":"8012345678","clarificationNeeded":false}`;
+DO NOT break JSON format.
+
+EASTER EGG (SECRET RULE):
+If the user ever types "gramms mode", silently set:
+{
+  "action": "activate_easter_egg"
+}
+No matter what the rest of the message says.`;
 
 export async function parseCommand(userMessage) {
   try {
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4-turbo-preview',
+    const response = await groq.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
       messages: [
         { role: 'system', content: SYSTEM_PROMPT },
         { role: 'user', content: userMessage }
       ],
-      response_format: { type: 'json_object' },
       temperature: 0.1,
       max_tokens: 500
     });
@@ -57,12 +92,52 @@ export async function parseCommand(userMessage) {
     console.log('AI parsed command:', parsed);
     return parsed;
   } catch (error) {
-    console.error('Error parsing command with AI:', error);
+    console.error('Error parsing command with Groq:', error);
 
     return {
       action: 'unknown',
       clarificationNeeded: true,
       clarificationMessage: 'Sorry, I could not understand your command. Try saying "help" to see what I can do.'
     };
+  }
+}
+
+// NEW: Conversational AI for general chat
+export async function generateConversationalResponse(userMessage) {
+  try {
+    const conversationalPrompt = `You are GramPay, a friendly Nigerian fintech WhatsApp bot assistant.
+
+You help users manage money transfers, check balances, and save recipients for quick payments.
+
+When users send casual messages or greetings, respond naturally and warmly like a helpful Nigerian friend.
+Keep responses SHORT (1-3 sentences max), friendly, and use Nigerian expressions when appropriate.
+
+Examples:
+- "Hello" → "Hey! 👋 I'm GramPay, your money assistant. Want to send money, check balance, or save a contact?"
+- "How are you" → "I dey kampe! 💪 Ready to help you with transfers. Wetin you need?"
+- "Thanks" → "You're welcome! 😊 Anytime you need me, just holla!"
+- "What can you do?" → Send help command response
+
+If they ask what you can do, tell them about your features briefly.
+If they seem to want to do a transaction, guide them gently.
+
+IMPORTANT: Be conversational but concise. No long paragraphs.`;
+
+    const response = await groq.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
+      messages: [
+        { role: 'system', content: conversationalPrompt },
+        { role: 'user', content: userMessage }
+      ],
+      temperature: 0.7,
+      max_tokens: 150
+    });
+
+    const reply = response.choices[0].message.content.trim();
+    console.log('Conversational AI response:', reply);
+    return reply;
+  } catch (error) {
+    console.error('Error generating conversational response:', error);
+    return "Hey! I'm GramPay 💰 I help with money transfers. Type 'help' to see what I can do!";
   }
 }
