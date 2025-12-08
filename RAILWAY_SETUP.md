@@ -34,7 +34,7 @@ To avoid scanning the QR code every time you deploy, you need a **Volume**.
 2.  Scroll down to **Service Domains** (optional, but good for webhooks).
 3.  Scroll to **Storage** (or "Volumes").
 4.  Click **Add Volume**.
-5.  Mount Path: `/app/baileys_auth_info`
+5.  Mount Path: `/app/baileys_auth_info`   - AUTHORIZED_PHONE_NUMBER
     -   *Note: Railway mounts volumes at absolute paths. Since our code uses `process.cwd()`, we need to make sure it aligns. By default, Railway app code is in `/app`.*
 
 ## Step 4: Connect WhatsApp

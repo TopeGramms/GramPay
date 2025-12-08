@@ -5,6 +5,7 @@ import { whatsappService } from './whatsapp.js';
 import { supabase } from './supabase.js';
 
 const pendingConfirmations = new Map();
+const sessionStore = new Map();
 
 export class CommandHandler {
   async handleMessage(from, message, messageId) {
@@ -13,7 +14,16 @@ export class CommandHandler {
         return await this.handleConfirmation(from, message);
       }
 
-      const parsedCommand = await parseCommand(message);
+      // Retrieve existing session memory or initialize empty
+      const userMemory = sessionStore.get(from) || {};
+
+      const parsedCommand = await parseCommand(message, userMemory);
+
+      // Update memory if the AI suggests it
+      if (parsedCommand.memoryUpdate) {
+        const updatedMemory = { ...userMemory, ...parsedCommand.memoryUpdate };
+        sessionStore.set(from, updatedMemory);
+      }
 
       // If action is unknown, use conversational AI instead of generic clarification
       if (parsedCommand.action === 'unknown') {
@@ -27,24 +37,35 @@ export class CommandHandler {
 
       switch (parsedCommand.action) {
         case 'send_money':
-          return await this.handleSendMoney(from, message, parsedCommand);
+          const response = await this.handleSendMoney(from, message, parsedCommand);
+          // If we successfully moved to confirmation (response contains confirmation text), clear gathering memory
+          if (response && response.includes('Transfer Confirmation')) {
+            sessionStore.delete(from);
+          }
+          return response;
 
         case 'add_recipient':
+          sessionStore.delete(from);
           return await this.handleAddRecipient(parsedCommand);
 
         case 'list_recipients':
+          sessionStore.delete(from);
           return await this.handleListRecipients();
 
         case 'check_balance':
+          sessionStore.delete(from);
           return await this.handleCheckBalance();
 
         case 'transaction_history':
+          sessionStore.delete(from);
           return await this.handleTransactionHistory();
 
         case 'delete_recipient':
+          sessionStore.delete(from);
           return await this.handleDeleteRecipient(parsedCommand);
 
         case 'set_pin':
+          sessionStore.delete(from);
           return await this.handleSetPin(parsedCommand);
 
         case 'help':
