@@ -51,7 +51,6 @@ If the user says:
 - User: “The Opay account is 9033…” → Store accountNumber.
 
 ### CLARIFICATION RULES
-### CLARIFICATION RULES
 1. If 'amount' is missing for send_money, ask for it.
 2. If 'recipient' is missing for send_money, ask for it.
 3. CRITICAL: For 'send_money', if you have a recipient NAME (e.g. "Tope"), do NOT ask for account number or bank. GramPay will look it up. Only ask if the user explicitly wants to add a NEW contact.
