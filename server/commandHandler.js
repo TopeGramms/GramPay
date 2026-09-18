@@ -169,12 +169,12 @@ export class CommandHandler {
           confirmation.recipient,
           confirmation.accountNumber,
           confirmation.bankName,
-          'completed',
+          'pending',
           transferResult.opayReference,
           confirmation.originalMessage
         );
 
-        return `✅ Transfer Successful!\n\n₦${confirmation.amount.toLocaleString()} sent to ${confirmation.recipient}\n\nReference: ${transferResult.opayReference}`;
+        return `⏳ Transfer initiated.\n\n₦${confirmation.amount.toLocaleString()} to ${confirmation.recipient} is awaiting confirmation from the payment provider.\n\nReference: ${transferResult.opayReference}`;
       } else {
         await transactionService.logTransaction(
           confirmation.amount,

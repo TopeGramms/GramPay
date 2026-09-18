@@ -20,12 +20,8 @@ function validateEnv() {
     process.exit(1);
   }
 
-  // Warn if OPay credentials are missing (optional but needed for money transfers)
-  const opayFields = ['OPAY_MERCHANT_ID', 'OPAY_PUBLIC_KEY', 'OPAY_PRIVATE_KEY'];
-  const opayMissing = opayFields.filter(key => !process.env[key]);
-  if (opayMissing.length > 0) {
-    console.warn('⚠️  OPay credentials not configured. Money transfer features will not work.');
-    console.warn('   Add OPAY_MERCHANT_ID, OPAY_PUBLIC_KEY, OPAY_PRIVATE_KEY to .env when ready.\n');
+  if (!process.env.FLW_SECRET_KEY) {
+    console.warn('⚠️  Flutterwave is not configured. Payouts are disabled.');
   }
 }
 
@@ -43,6 +39,13 @@ export const config = {
   groq: {
     apiKey: process.env.GROQ_API_KEY
   },
+  flutterwave: {
+    secretKey: process.env.FLW_SECRET_KEY,
+    webhookSecret: process.env.FLW_WEBHOOK_SECRET,
+    transferCallbackUrl: process.env.FLW_TRANSFER_CALLBACK_URL,
+    apiBaseUrl: 'https://api.flutterwave.com/v3'
+  },
+  // Temporary compatibility while the transfer client is migrated.
   opay: {
     merchantId: process.env.OPAY_MERCHANT_ID,
     publicKey: process.env.OPAY_PUBLIC_KEY,

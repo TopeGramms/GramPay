@@ -531,21 +531,19 @@ app.get('/api/balance', async (req, res) => {
 });
 
 // ============ Webhook Endpoints ============
-app.post('/api/payment-webhook', async (req, res) => {
+app.post('/api/flutterwave/webhook', async (req, res) => {
   try {
-    console.log('🔔 Received OPay Webhook:', JSON.stringify(req.body, null, 2));
-
-    const signature = req.headers['signature'] || req.headers['Signature'];
+    const signature = req.headers['verif-hash'];
     const result = await opayService.handleWebhook(req.body, signature);
 
     if (result.success) {
-      res.json({ responseCode: '00000', responseMessage: 'SUCCESS' });
+      res.sendStatus(200);
     } else {
-      res.status(400).json({ responseCode: '99999', responseMessage: result.message });
+      res.sendStatus(401);
     }
   } catch (error) {
     console.error('Webhook endpoint error:', error);
-    res.status(500).json({ responseCode: '99999', responseMessage: 'Internal Server Error' });
+    res.sendStatus(500);
   }
 });
 

@@ -3,68 +3,44 @@ import crypto from 'crypto';
 import { config } from './config.js';
 import { supabase } from './supabase.js';
 
-export class OpayPaymentService {
+export class FlutterwavePaymentService {
   constructor() {
-    this.merchantId = config.opay.merchantId;
-    this.publicKey = config.opay.publicKey;
-    this.privateKey = config.opay.privateKey;
-    this.baseUrl = config.opay.apiBaseUrl;
+    this.secretKey = config.flutterwave.secretKey;
+    this.webhookSecret = config.flutterwave.webhookSecret;
+    this.callbackUrl = config.flutterwave.transferCallbackUrl;
+    this.baseUrl = config.flutterwave.apiBaseUrl;
   }
 
-  generateSignature(data) {
-    const sortedKeys = Object.keys(data).sort();
-    const signatureString = sortedKeys
-      .map(key => `${key}=${data[key]}`)
-      .join('&');
-
-    const signature = crypto
-      .createHmac('sha512', this.privateKey)
-      .update(signatureString)
-      .digest('hex');
-
-    return signature;
-  }
-
-  async transfer(amount, accountNumber, bankCode = '058', reference = null) {
+  async transfer(amount, accountNumber, bankCode, reference = null) {
     try {
-      const transactionRef = reference || `TXN_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      if (!this.secretKey || !bankCode) return { success: false, message: 'Payout service is not configured.' };
+      const transactionRef = reference || `GP_${crypto.randomUUID()}`;
 
       const requestData = {
-        merchantId: this.merchantId,
         reference: transactionRef,
-        amount: Math.round(amount * 100),
+        amount,
         currency: 'NGN',
-        receiver: {
-          bankAccountNumber: accountNumber,
-          bankCode: bankCode,
-          name: 'Recipient'
-        },
-        country: 'NG'
+        account_number: accountNumber,
+        account_bank: bankCode,
+        narration: 'GramPay private beta payout',
+        callback_url: this.callbackUrl
       };
-
-      const signature = this.generateSignature(requestData);
-
       const response = await axios.post(
-        `${this.baseUrl}/api/v1/international/cashout/initialize`,
+        `${this.baseUrl}/transfers`,
         requestData,
         {
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${this.publicKey}`,
-            'MerchantId': this.merchantId,
-            'Signature': signature
+            'Authorization': `Bearer ${this.secretKey}`
           }
         }
       );
-
-      console.log('Opay transfer response:', response.data);
-
-      if (response.data.code === '00000' || response.data.message === 'SUCCESSFUL') {
+      if (response.data.status === 'success') {
         return {
           success: true,
           reference: transactionRef,
-          opayReference: response.data.data?.reference || transactionRef,
-          message: 'Transfer successful',
+          opayReference: response.data.data?.id?.toString() || transactionRef,
+          message: 'Transfer initiated',
           data: response.data
         };
       } else {
@@ -76,7 +52,7 @@ export class OpayPaymentService {
         };
       }
     } catch (error) {
-      console.error('Opay transfer error:', error.response?.data || error.message);
+      console.error('Flutterwave transfer error:', error.response?.data || error.message);
       return {
         success: false,
         message: error.response?.data?.message || error.message || 'Transfer failed',
@@ -85,52 +61,7 @@ export class OpayPaymentService {
     }
   }
 
-  async checkBalance() {
-    try {
-      const requestData = {
-        merchantId: this.merchantId
-      };
-
-      const signature = this.generateSignature(requestData);
-
-      const response = await axios.post(
-        `${this.baseUrl}/api/v1/international/balance/query`,
-        requestData,
-        {
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${this.publicKey}`,
-            'MerchantId': this.merchantId,
-            'Signature': signature
-          }
-        }
-      );
-
-      console.log('Opay balance response:', response.data);
-
-      if (response.data.code === '00000' || response.data.message === 'SUCCESSFUL') {
-        const balance = response.data.data?.balance || 0;
-        return {
-          success: true,
-          balance: balance / 100,
-          currency: 'NGN',
-          message: `Balance: ₦${(balance / 100).toLocaleString()}`
-        };
-      } else {
-        return {
-          success: false,
-          message: 'Failed to retrieve balance'
-        };
-      }
-    } catch (error) {
-      console.error('Opay balance check error:', error.response?.data || error.message);
-      return {
-        success: false,
-        message: 'Failed to check balance',
-        error: error.response?.data || error.message
-      };
-    }
-  }
+  async checkBalance() { return { success: false, message: 'Balance is not exposed during the private beta.' }; }
 
   validateAccountNumber(accountNumber) {
     const cleaned = accountNumber.replace(/\D/g, '');
@@ -139,22 +70,14 @@ export class OpayPaymentService {
 
   async handleWebhook(data, signature) {
     try {
-      // 1. Verify signature
-      const calculatedSignature = this.generateSignature(data);
-
-      if (calculatedSignature !== signature) {
-        console.warn('⚠️ Invalid webhook signature:', { received: signature, calculated: calculatedSignature });
+      if (!this.webhookSecret || signature !== this.webhookSecret) {
         return { success: false, message: 'Invalid signature' };
       }
-
-      console.log('✅ Webhook signature verified');
-
-      // 2. Process the payload
-      const { reference, orderNo, amount, status, statusDesc } = data;
-
-      // Map OPay status to our status
+      const transfer = data.data || {};
+      const { reference } = transfer;
+      const status = transfer.status;
       let transactionStatus = 'pending';
-      if (status === 'SUCCESS' || status === '00000') {
+      if (status === 'SUCCESSFUL') {
         transactionStatus = 'completed';
       } else if (status === 'FAILED') {
         transactionStatus = 'failed';
@@ -165,7 +88,7 @@ export class OpayPaymentService {
         .from('transactions')
         .update({
           status: transactionStatus,
-          opay_reference: orderNo || reference
+          opay_reference: transfer.id?.toString() || reference
         })
         .eq('opay_reference', reference)
         .select()
@@ -284,5 +207,5 @@ export class TransactionService {
   }
 }
 
-export const opayService = new OpayPaymentService();
+export const opayService = new FlutterwavePaymentService();
 export const transactionService = new TransactionService();
