@@ -39,6 +39,12 @@ export const config = {
   groq: {
     apiKey: process.env.GROQ_API_KEY
   },
+  whatsapp: {
+    verifyToken: process.env.WHATSAPP_VERIFY_TOKEN,
+    phoneNumberId: process.env.WHATSAPP_PHONE_NUMBER_ID,
+    accessToken: process.env.WHATSAPP_ACCESS_TOKEN,
+    graphApiVersion: process.env.WHATSAPP_GRAPH_API_VERSION || 'v22.0'
+  },
   flutterwave: {
     secretKey: process.env.FLW_SECRET_KEY,
     webhookSecret: process.env.FLW_WEBHOOK_SECRET,

@@ -1,7 +1,6 @@
 import express from 'express';
-import QRCode from 'qrcode';
 import { config } from './config.js';
-import { whatsappService } from './whatsapp.js';
+import { whatsappService } from './whatsappCloud.js';
 import { commandHandler } from './commandHandler.js';
 import { recipientService } from './recipients.js';
 import { opayService, transactionService } from './payments.js';
@@ -11,6 +10,13 @@ const app = express();
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+app.get('/webhook', (req, res) => {
+  const { 'hub.mode': mode, 'hub.verify_token': token, 'hub.challenge': challenge } = req.query;
+  if (mode === 'subscribe' && token === config.whatsapp.verifyToken) return res.status(200).send(challenge);
+  return res.sendStatus(403);
+});
+app.post('/webhook', async (req, res) => { res.sendStatus(200); try { await whatsappService.receive(req.body); } catch (error) { console.error('Cloud API message error:', error.message); } });
 
 // ============ WhatsApp Initialization ============
 let whatsappReady = false;
