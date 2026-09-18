@@ -3,5 +3,5 @@ import { config } from './config.js';
 
 export const supabase = createClient(
   config.supabase.url,
-  config.supabase.anonKey
+  process.env.SUPABASE_SERVICE_ROLE_KEY || config.supabase.anonKey
 );
