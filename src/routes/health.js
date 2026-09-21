@@ -1,7 +1,15 @@
 import { Router } from 'express';
 import { config } from '../config/env.js';
 
-const router = Router();
+router.get('/', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    service: 'grampay-api',
+    message: 'Welcome to GramPay API — WhatsApp AI Money Assistant',
+    health: '/health',
+    status_page: '/status',
+  });
+});
 
 router.get('/health', (req, res) => {
   res.status(200).json({

@@ -5,7 +5,7 @@ import { userContextService } from '../core/userContext.js';
 
 const router = Router();
 
-router.use(requireAdminAuth);
+router.use('/api', requireAdminAuth);
 
 /**
  * GET /api/recipients - Fetch saved recipients

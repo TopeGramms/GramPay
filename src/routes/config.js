@@ -6,7 +6,7 @@ import { supabase } from '../db/supabase.js';
 
 const router = Router();
 
-router.use(requireAdminAuth);
+router.use('/api', requireAdminAuth);
 
 /**
  * GET /api/config - Get user configuration
