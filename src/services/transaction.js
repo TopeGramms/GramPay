@@ -61,6 +61,13 @@ export class TransactionService {
         throw error;
       }
 
+      return data;
+    } catch (err) {
+      logger.error({ err: err.message }, 'Transaction Update Error');
+      throw err;
+    }
+  }
+
   /**
    * Update transaction status by Flutterwave reference
    */
