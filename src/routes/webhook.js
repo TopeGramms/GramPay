@@ -24,7 +24,7 @@ router.get('/webhook', (req, res) => {
     }
   }
 
-  res.sendStatus(400);
+  res.status(200).send('Meta WhatsApp Cloud API Webhook Endpoint Active');
 });
 
 /**
