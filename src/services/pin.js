@@ -14,3 +14,6 @@ export class PinService {
     return await bcrypt.compare(pin.trim(), hash);
   }
 }
+
+export const pinService = new PinService();
+

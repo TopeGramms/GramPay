@@ -3,7 +3,7 @@ import { whatsappService } from '../services/whatsappCloud.js';
 import { paymentService } from '../services/payment.js';
 import { recipientService } from '../services/recipient.js';
 import { transactionService } from '../services/transaction.js';
-import { pinService, PinService } from '../services/pin.js';
+import { PinService } from '../services/pin.js';
 import { userContextService } from './userContext.js';
 import { CONSTANTS } from '../config/constants.js';
 import { logger } from '../lib/logger.js';
