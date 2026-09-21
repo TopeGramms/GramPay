@@ -15,6 +15,9 @@ import { errorHandler } from './middleware/errorHandler.js';
 export function createApp() {
   const app = express();
 
+  // Trust Render reverse proxy for rate limiting IP extraction
+  app.set('trust proxy', 1);
+
   // Security Headers
   app.use(helmet());
 
