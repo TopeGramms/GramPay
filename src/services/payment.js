@@ -38,23 +38,38 @@ export class FlutterwavePaymentService {
         this.banksCacheExpiry = now + (24 * 60 * 60 * 1000); // 24h
         return this.banksCache;
       }
-      return [];
+      return this.getDefaultBankList();
     } catch (error) {
-      logger.error({ error: error.message }, 'Failed to fetch bank list from Flutterwave');
-      // Fallback default list if API fails
-      return [
-        { code: '058', name: 'Guaranty Trust Bank', aliases: ['gtb', 'gtbank'] },
-        { code: '090267', name: 'Kuda Bank', aliases: ['kuda'] },
-        { code: '090360', name: 'Opay', aliases: ['opay', 'paycom'] },
-        { code: '090405', name: 'Moniepoint', aliases: ['moniepoint'] },
-        { code: '090175', name: 'Palmpay', aliases: ['palmpay'] },
-        { code: '011', name: 'First Bank of Nigeria', aliases: ['firstbank', 'first bank'] },
-        { code: '057', name: 'Zenith Bank', aliases: ['zenith'] },
-        { code: '044', name: 'Access Bank', aliases: ['access'] },
-        { code: '214', name: 'First City Monument Bank', aliases: ['fcmb'] },
-        { code: '033', name: 'United Bank For Africa', aliases: ['uba'] }
-      ];
+      logger.error({ error: error.message }, 'Failed to fetch bank list from Flutterwave. Using fallback bank list.');
+      return this.getDefaultBankList();
     }
+  }
+
+  /**
+   * Comprehensive default Nigerian bank list with aliases
+   */
+  getDefaultBankList() {
+    return [
+      { code: '090360', name: 'Opay', aliases: ['opay', 'paycom', 'opay digital', 'opay microfinance'] },
+      { code: '090267', name: 'Kuda Bank', aliases: ['kuda', 'kudabank', 'kuda microfinance'] },
+      { code: '090405', name: 'Moniepoint', aliases: ['moniepoint', 'moniepoint microfinance', 'moniepoint bank'] },
+      { code: '090175', name: 'Palmpay', aliases: ['palmpay', 'palm pay'] },
+      { code: '058', name: 'Guaranty Trust Bank', aliases: ['gtb', 'gtbank', 'guaranty trust'] },
+      { code: '057', name: 'Zenith Bank', aliases: ['zenith', 'zenithbank'] },
+      { code: '044', name: 'Access Bank', aliases: ['access', 'accessbank'] },
+      { code: '011', name: 'First Bank of Nigeria', aliases: ['firstbank', 'first bank', 'fbn'] },
+      { code: '033', name: 'United Bank For Africa', aliases: ['uba', 'united bank for africa'] },
+      { code: '214', name: 'First City Monument Bank', aliases: ['fcmb', 'first city monument'] },
+      { code: '221', name: 'Stanbic IBTC Bank', aliases: ['stanbic', 'stanbic ibtc'] },
+      { code: '232', name: 'Sterling Bank', aliases: ['sterling', 'sterlingbank'] },
+      { code: '035', name: 'Wema Bank', aliases: ['wema', 'alat', 'alat by wema'] },
+      { code: '076', name: 'Polaris Bank', aliases: ['polaris', 'skye'] },
+      { code: '032', name: 'Union Bank of Nigeria', aliases: ['union', 'unionbank'] },
+      { code: '050', name: 'Ecobank Nigeria', aliases: ['ecobank'] },
+      { code: '215', name: 'Unity Bank', aliases: ['unity', 'unitybank'] },
+      { code: '082', name: 'Keystone Bank', aliases: ['keystone'] },
+      { code: '301', name: 'JAIZ Bank', aliases: ['jaiz'] },
+    ];
   }
 
   /**
@@ -64,7 +79,7 @@ export class FlutterwavePaymentService {
    */
   async resolveBankCode(bankQuery) {
     if (!bankQuery) return null;
-    const query = bankQuery.trim().toLowerCase();
+    const query = bankQuery.trim().toLowerCase().replace(/[.,!?]+$/, '').trim();
     const banks = await this.getBanks();
 
     // 1. Direct match on code
@@ -75,14 +90,19 @@ export class FlutterwavePaymentService {
     const exactNameMatch = banks.find(b => b.name.toLowerCase() === query);
     if (exactNameMatch) return exactNameMatch.code;
 
-    // 3. Match on aliases or partial name substring
-    const partialMatch = banks.find(b => {
-      const name = b.name.toLowerCase();
-      if (name.includes(query) || query.includes(name)) return true;
+    // 3. Match on aliases array
+    const aliasMatch = banks.find(b => {
       if (b.aliases && Array.isArray(b.aliases)) {
-        return b.aliases.some(alias => alias.includes(query) || query.includes(alias));
+        return b.aliases.some(alias => alias === query || query.includes(alias) || alias.includes(query));
       }
       return false;
+    });
+    if (aliasMatch) return aliasMatch.code;
+
+    // 4. Substring match on bank name
+    const partialMatch = banks.find(b => {
+      const name = b.name.toLowerCase();
+      return name.includes(query) || query.includes(name);
     });
 
     return partialMatch ? partialMatch.code : null;
@@ -111,8 +131,9 @@ export class FlutterwavePaymentService {
       }
       return { success: false, message: response.data?.message || 'Account resolution failed' };
     } catch (error) {
+      const errorMsg = error.response?.data?.message || error.message;
       logger.error({ accountNumber, bankCode, error: error.response?.data || error.message }, 'Bank account resolution error');
-      return { success: false, message: 'Could not resolve account details with bank' };
+      return { success: false, message: errorMsg || 'Could not resolve account details with bank' };
     }
   }
 
@@ -144,7 +165,7 @@ export class FlutterwavePaymentService {
       narration: narration,
       currency: CONSTANTS.DEFAULT_CURRENCY,
       reference: txRef,
-      callback_url: `${process.env.APP_URL || 'https://grampay.onrender.com'}/api/flutterwave/webhook`,
+      callback_url: `${process.env.APP_URL || 'https://grampay-3m3e.onrender.com'}/api/flutterwave/webhook`,
       debit_currency: CONSTANTS.DEFAULT_CURRENCY,
     };
 
