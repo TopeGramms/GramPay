@@ -112,6 +112,8 @@ export class FlutterwavePaymentService {
    * Verify bank account number and return account name
    */
   async verifyAccount(accountNumber, bankCode) {
+    const isTestKey = !this.secretKey || this.secretKey.startsWith('FLWSECK_TEST');
+
     if (!this.secretKey) {
       return { success: true, accountName: 'Test Account (Simulated)' };
     }
@@ -129,10 +131,22 @@ export class FlutterwavePaymentService {
           accountNumber: response.data.data.account_number,
         };
       }
+
+      if (isTestKey) {
+        logger.info({ accountNumber, bankCode }, 'Flutterwave Sandbox Test Key in use: Account resolution simulated.');
+        return { success: true, accountName: 'Simulated Verified Account' };
+      }
+
       return { success: false, message: response.data?.message || 'Account resolution failed' };
     } catch (error) {
       const errorMsg = error.response?.data?.message || error.message;
       logger.error({ accountNumber, bankCode, error: error.response?.data || error.message }, 'Bank account resolution error');
+      
+      if (isTestKey) {
+        logger.info({ accountNumber, bankCode }, 'Flutterwave Sandbox Test Key in use: Simulating verified account for sandbox testing.');
+        return { success: true, accountName: 'Simulated Verified Account' };
+      }
+
       return { success: false, message: errorMsg || 'Could not resolve account details with bank' };
     }
   }
