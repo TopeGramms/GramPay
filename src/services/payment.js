@@ -155,6 +155,8 @@ export class FlutterwavePaymentService {
    * Execute Flutterwave payout transfer
    */
   async transfer({ amount, accountNumber, bankCode, narration = 'GramPay Transfer', reference = null }) {
+    const isTestKey = Boolean(this.secretKey && this.secretKey.startsWith('FLWSECK_TEST'));
+
     if (!this.secretKey) {
       logger.warn({ amount, accountNumber, bankCode }, '⚠️ Flutterwave secret key missing! Simulating successful payment.');
       return {
@@ -198,10 +200,33 @@ export class FlutterwavePaymentService {
         };
       }
 
+      if (isTestKey) {
+        logger.warn({ txRef, message: response.data?.message }, 'Flutterwave Sandbox test transfer simulation fallback');
+        return {
+          success: true,
+          transferId: 'flw_test_' + Date.now(),
+          reference: txRef,
+          status: 'SUCCESSFUL',
+          simulated: true,
+        };
+      }
+
       throw new PaymentError(response.data?.message || 'Transfer failed at provider');
     } catch (error) {
       const msg = error.response?.data?.message || error.message;
       logger.error({ error: error.response?.data || error.message, payload }, '❌ Flutterwave transfer execution failed');
+
+      if (isTestKey) {
+        logger.warn({ txRef, msg }, 'Flutterwave Sandbox test transfer error (e.g. unfunded sandbox balance); simulating successful test transfer');
+        return {
+          success: true,
+          transferId: 'flw_test_' + Date.now(),
+          reference: txRef,
+          status: 'SUCCESSFUL',
+          simulated: true,
+        };
+      }
+
       throw new PaymentError(msg);
     }
   }

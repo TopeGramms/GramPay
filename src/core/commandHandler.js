@@ -139,7 +139,7 @@ export class CommandHandler {
       if (foundContact) {
         session.accountNumber = foundContact.account_number;
         session.bankName = foundContact.bank_name;
-        session.bankCode = foundFoundCode(foundContact.bank_code);
+        session.bankCode = foundContact.bank_code;
         session.recipientName = foundContact.nickname || foundContact.name;
         await this.verifyAndPromptConfirmation(from, user, session, messageId);
         return;
@@ -221,7 +221,15 @@ export class CommandHandler {
         const hash = await PinService.hashPin(text);
         await userContextService.updateUserPin(user.id, hash);
         user.pin_hash = hash;
-        await this.executeTransfer(from, user, session, messageId);
+
+        // If this session had an active transfer pending, execute it
+        if (session.amount && (session.accountNumber || session.recipientName)) {
+          pendingSessions.delete(from);
+          await this.executeTransfer(from, user, session, messageId);
+        } else {
+          pendingSessions.delete(from);
+          await whatsappService.sendMessage(from, '🔐 *PIN Set Successfully!* Your 4-digit PIN is now active.');
+        }
         return;
       }
       await whatsappService.sendMessage(from, '⚠️ PIN must be exactly 4 digits. Please enter a valid 4-digit PIN:');
@@ -249,7 +257,8 @@ export class CommandHandler {
         return;
       }
 
-      // PIN valid -> Execute payout
+      // PIN valid -> Delete pending session before executing payout to prevent double-tap race condition
+      pendingSessions.delete(from);
       await this.executeTransfer(from, user, session, messageId);
     }
   }
@@ -368,6 +377,12 @@ export class CommandHandler {
     }
 
     // Limits Validation
+    if (session.amount < CONSTANTS.MIN_SINGLE_TRANSFER) {
+      pendingSessions.delete(from);
+      await whatsappService.sendMessage(from, `⚠️ Minimum single transfer limit is NGN ${CONSTANTS.MIN_SINGLE_TRANSFER.toLocaleString()}.`);
+      return;
+    }
+
     if (session.amount > CONSTANTS.MAX_SINGLE_TRANSFER) {
       pendingSessions.delete(from);
       await whatsappService.sendMessage(from, `⚠️ Maximum single transfer limit is NGN ${CONSTANTS.MAX_SINGLE_TRANSFER.toLocaleString()}.`);
@@ -461,18 +476,21 @@ export class CommandHandler {
         reference: session.idempotencyKey,
       });
 
-      // 3. Update DB record status
-      await transactionService.updateStatus(initialTx.id, 'completed', {
+      // 3. Update DB record status - Flutterwave initial status is typically PENDING/NEW
+      const txStatus = result.status === 'SUCCESSFUL' ? 'completed' : 'processing';
+      await transactionService.updateStatus(initialTx.id, txStatus, {
         flwRef: result.reference,
         transferId: result.transferId,
       });
 
       pendingSessions.delete(from);
 
-      const successMsg = `✅ *Transfer Successful!*\n\n` +
+      const statusTitle = result.status === 'SUCCESSFUL' ? 'Transfer Successful!' : 'Transfer Initiated!';
+      const successMsg = `✅ *${statusTitle}*\n\n` +
         `*Amount:* NGN ${session.amount.toLocaleString()}\n` +
         `*Recipient:* ${session.recipientName}\n` +
         `*Account:* ${session.accountNumber} (${session.bankName})\n` +
+        `*Status:* ${result.status || 'PROCESSING'}\n` +
         `*Ref:* ${result.reference || result.transferId}`;
 
       await whatsappService.sendMessage(from, successMsg);
@@ -499,7 +517,20 @@ export class CommandHandler {
     }
 
     const bankCode = await paymentService.resolveBankCode(bankName);
+    if (!bankCode) {
+      await whatsappService.sendMessage(from, `⚠️ Could not identify bank "${bankName}". Please check the bank name and try again.`);
+      return;
+    }
+
     const verification = await paymentService.verifyAccount(accountNumber, bankCode);
+    if (!verification.success) {
+      await whatsappService.sendMessage(
+        from,
+        `❌ Could not verify account ${accountNumber} with ${bankName}: ${verification.message || 'Invalid account details'}`
+      );
+      return;
+    }
+
     const resolvedName = verification.accountName || recipientName || 'Saved Contact';
 
     await recipientService.addRecipient(user.id, {
@@ -510,7 +541,7 @@ export class CommandHandler {
       bankCode,
     });
 
-    await whatsappService.sendMessage(from, `✅ Saved *${recipientName || resolvedName}* (${accountNumber} - ${bankName}) to your contacts!`);
+    await whatsappService.sendMessage(from, `✅ Saved *${recipientName || resolvedName}* (${resolvedName} - ${bankName}) to your contacts!`);
   }
 
   /**
@@ -573,9 +604,11 @@ export class CommandHandler {
       return this.handleActiveSession(from, pin, user, activeSession);
     }
 
-    const hash = await PinService.hashPin(pin);
-    await userContextService.updateUserPin(user.id, hash);
-    await whatsappService.sendMessage(from, '🔐 Your 4-digit PIN has been set!');
+    // Do NOT set PIN from an unsolicited 4-digit number
+    await whatsappService.sendMessage(
+      from,
+      'ℹ️ If you want to change your PIN, please say *"Set PIN"*. Otherwise, tell me what you would like to do (e.g., *"Send 5000 to Mom"*).'
+    );
   }
 
   /**
