@@ -28,8 +28,11 @@ export function verifyMetaSignature(req, res, next) {
     .update(req.rawBody || JSON.stringify(req.body))
     .digest('hex');
 
-  if (signatureHash !== expectedHash) {
-    logger.error({ received: signatureHash, expected: expectedHash }, 'Meta Webhook signature mismatch');
+  const sigBuffer = Buffer.from(signatureHash || '', 'hex');
+  const expBuffer = Buffer.from(expectedHash, 'hex');
+
+  if (sigBuffer.length !== expBuffer.length || !crypto.timingSafeEqual(sigBuffer, expBuffer)) {
+    logger.warn('Meta Webhook signature mismatch');
     return res.status(401).json({ error: 'Invalid webhook signature' });
   }
 

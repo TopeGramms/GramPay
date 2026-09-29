@@ -25,7 +25,9 @@ export class CommandHandler {
 
     const cleanFrom = from.replace(/\D/g, '');
     const cleanText = text.trim();
-    logger.info({ from: cleanFrom, text: cleanText }, '📩 Processing incoming WhatsApp message');
+    const isPotentialPin = /^\d{4}$/.test(cleanText);
+    const logText = isPotentialPin ? '****' : cleanText.replace(/\b\d{10}\b/g, (acc) => `******${acc.slice(-4)}`);
+    logger.info({ from: cleanFrom, text: logText }, '📩 Processing incoming WhatsApp message');
 
     // 1. Resolve User Context
     const user = await userContextService.resolveUser(cleanFrom);
@@ -214,25 +216,77 @@ export class CommandHandler {
     }
 
     // -------------------------------------------------------------
-    // STATE 5: SETTING_PIN_FIRST
+    // STATE: AWAITING_OLD_PIN_FOR_CHANGE (Verifying existing PIN before change)
+    // -------------------------------------------------------------
+    if (session.state === 'AWAITING_OLD_PIN_FOR_CHANGE') {
+      if (!/^\d{4}$/.test(text)) {
+        await whatsappService.sendMessage(from, '⚠️ Please enter your current 4-digit numeric PIN:');
+        return;
+      }
+
+      const isValid = await PinService.verifyPin(text, user.pin_hash);
+      if (!isValid) {
+        session.oldPinAttempts = (session.oldPinAttempts || 0) + 1;
+        if (session.oldPinAttempts >= 3) {
+          pendingSessions.delete(from);
+          await whatsappService.sendMessage(from, '🚫 Maximum invalid attempts reached. PIN change cancelled.');
+          return;
+        }
+        await whatsappService.sendMessage(from, `❌ Incorrect current PIN (${3 - session.oldPinAttempts} attempt(s) remaining). Please try again:`);
+        return;
+      }
+
+      session.state = 'SETTING_PIN_FIRST';
+      pendingSessions.set(from, session);
+      await whatsappService.sendMessage(from, '✅ Current PIN verified. Please enter your **new 4-digit PIN**:');
+      return;
+    }
+
+    // -------------------------------------------------------------
+    // STATE 5: SETTING_PIN_FIRST (First entry of new PIN)
     // -------------------------------------------------------------
     if (session.state === 'SETTING_PIN_FIRST') {
       if (/^\d{4}$/.test(text)) {
-        const hash = await PinService.hashPin(text);
-        await userContextService.updateUserPin(user.id, hash);
-        user.pin_hash = hash;
-
-        // If this session had an active transfer pending, execute it
-        if (session.amount && (session.accountNumber || session.recipientName)) {
-          pendingSessions.delete(from);
-          await this.executeTransfer(from, user, session, messageId);
-        } else {
-          pendingSessions.delete(from);
-          await whatsappService.sendMessage(from, '🔐 *PIN Set Successfully!* Your 4-digit PIN is now active.');
-        }
+        session.newPinCandidate = text;
+        session.state = 'CONFIRMING_NEW_PIN';
+        pendingSessions.set(from, session);
+        await whatsappService.sendMessage(from, '🔐 Please **re-enter** your new 4-digit PIN to confirm:');
         return;
       }
       await whatsappService.sendMessage(from, '⚠️ PIN must be exactly 4 digits. Please enter a valid 4-digit PIN:');
+      return;
+    }
+
+    // -------------------------------------------------------------
+    // STATE: CONFIRMING_NEW_PIN (Double confirmation of new PIN)
+    // -------------------------------------------------------------
+    if (session.state === 'CONFIRMING_NEW_PIN') {
+      if (!/^\d{4}$/.test(text)) {
+        await whatsappService.sendMessage(from, '⚠️ Please re-enter your 4-digit numeric PIN to confirm:');
+        return;
+      }
+
+      if (text !== session.newPinCandidate) {
+        delete session.newPinCandidate;
+        session.state = 'SETTING_PIN_FIRST';
+        pendingSessions.set(from, session);
+        await whatsappService.sendMessage(from, '❌ PINs do not match. Let\'s try again. Please enter your new 4-digit PIN:');
+        return;
+      }
+
+      const hash = await PinService.hashPin(text);
+      await userContextService.updateUserPin(user.id, hash);
+      user.pin_hash = hash;
+      delete session.newPinCandidate;
+
+      // If this session had an active transfer pending, execute it
+      if (session.amount && (session.accountNumber || session.recipientName)) {
+        pendingSessions.delete(from);
+        await this.executeTransfer(from, user, session, messageId);
+      } else {
+        pendingSessions.delete(from);
+        await whatsappService.sendMessage(from, '🔐 *PIN Set Successfully!* Your new 4-digit PIN is now active.');
+      }
       return;
     }
 
@@ -468,11 +522,15 @@ export class CommandHandler {
 
     // 2. Call Flutterwave Transfer API
     try {
+      // Sanitize narration: alphanumeric + spaces only, max 40 chars
+      const safeRecipient = (session.recipientName || 'Recipient').replace(/[^a-zA-Z0-9 ]/g, '').trim().slice(0, 20);
+      const safeNarration = `GramPay payout to ${safeRecipient}`.slice(0, 40);
+
       const result = await paymentService.transfer({
         amount: session.amount,
         accountNumber: session.accountNumber,
         bankCode: session.bankCode,
-        narration: `GramPay payout to ${session.recipientName}`,
+        narration: safeNarration,
         reference: session.idempotencyKey,
       });
 
@@ -502,7 +560,10 @@ export class CommandHandler {
       });
 
       pendingSessions.delete(from);
-      await whatsappService.sendMessage(from, `❌ Transfer failed: ${error.message}`);
+      const userSafeMsg = error.isOperational
+        ? error.message
+        : 'The transfer could not be completed by the bank. Please try again later.';
+      await whatsappService.sendMessage(from, `❌ Transfer failed: ${userSafeMsg}`);
     }
   }
 
@@ -580,10 +641,13 @@ export class CommandHandler {
    * Handle user request to set/update PIN
    */
   async handleSetPinRequest(from, user, parsed) {
-    if (parsed.pin) {
-      const hash = await PinService.hashPin(parsed.pin);
-      await userContextService.updateUserPin(user.id, hash);
-      await whatsappService.sendMessage(from, '🔐 *PIN Updated Successfully!* Your 4-digit PIN is now set.');
+    if (user.pin_hash) {
+      pendingSessions.set(from, {
+        state: 'AWAITING_OLD_PIN_FOR_CHANGE',
+        timestamp: Date.now(),
+        oldPinAttempts: 0,
+      });
+      await whatsappService.sendMessage(from, '🔒 To change your PIN, please enter your **current 4-digit PIN**:');
       return;
     }
 

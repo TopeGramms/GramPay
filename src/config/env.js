@@ -16,7 +16,7 @@ export const config = {
   env: process.env.NODE_ENV || 'development',
   port: parseInt(process.env.PORT || '3000', 10),
   
-  adminApiKey: getEnv('ADMIN_API_KEY', 'default_grampay_admin_secret_change_me'),
+  adminApiKey: getEnv('ADMIN_API_KEY', process.env.NODE_ENV === 'production' ? '' : 'dev_grampay_admin_secret_key', process.env.NODE_ENV === 'production'),
 
   supabase: {
     url: getEnv('SUPABASE_URL', '', true),

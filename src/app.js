@@ -22,8 +22,12 @@ export function createApp() {
   app.use(helmet());
 
   // CORS Configuration
+  const allowedOrigins = process.env.CORS_ORIGIN
+    ? (process.env.CORS_ORIGIN.includes(',') ? process.env.CORS_ORIGIN.split(',').map(s => s.trim()) : process.env.CORS_ORIGIN)
+    : (process.env.NODE_ENV === 'production' ? false : '*');
+
   app.use(cors({
-    origin: process.env.CORS_ORIGIN || '*',
+    origin: allowedOrigins,
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
   }));

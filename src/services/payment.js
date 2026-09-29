@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import axios from 'axios';
 import { config } from '../config/env.js';
 import { CONSTANTS } from '../config/constants.js';
@@ -214,7 +215,11 @@ export class FlutterwavePaymentService {
       throw new PaymentError(response.data?.message || 'Transfer failed at provider');
     } catch (error) {
       const msg = error.response?.data?.message || error.message;
-      logger.error({ error: error.response?.data || error.message, payload }, '❌ Flutterwave transfer execution failed');
+      const maskedPayload = payload ? {
+        ...payload,
+        account_number: payload.account_number ? `******${payload.account_number.slice(-4)}` : undefined,
+      } : {};
+      logger.error({ error: error.response?.data || error.message, payload: maskedPayload }, '❌ Flutterwave transfer execution failed');
 
       if (isTestKey) {
         logger.warn({ txRef, msg }, 'Flutterwave Sandbox test transfer error (e.g. unfunded sandbox balance); simulating successful test transfer');
@@ -236,10 +241,26 @@ export class FlutterwavePaymentService {
    */
   verifyWebhookSignature(signatureHeader) {
     if (!this.webhookSecret) {
+      if (process.env.NODE_ENV === 'production') {
+        logger.error('FLW_WEBHOOK_SECRET is not configured in production mode!');
+        return false;
+      }
       logger.warn('⚠️ FLW_WEBHOOK_SECRET not set in env. Webhook signature check will pass in non-prod mode.');
-      return process.env.NODE_ENV !== 'production';
+      return true;
     }
-    return signatureHeader === this.webhookSecret;
+
+    if (!signatureHeader || typeof signatureHeader !== 'string') {
+      return false;
+    }
+
+    const sigBuf = Buffer.from(signatureHeader, 'utf8');
+    const secretBuf = Buffer.from(this.webhookSecret, 'utf8');
+
+    if (sigBuf.length !== secretBuf.length) {
+      return false;
+    }
+
+    return crypto.timingSafeEqual(sigBuf, secretBuf);
   }
 }
 
