@@ -37,6 +37,21 @@ export class TransactionService {
         return data;
       }
 
+      // Check if this was a duplicate idempotency key (code 23505)
+      if (error && (error.code === '23505' || error.message?.includes('duplicate key') || error.message?.includes('unique constraint'))) {
+        logger.warn({ key }, 'Duplicate transaction idempotency key detected; retrieving existing transaction record');
+        const { data: existingTx } = await supabase
+          .from('transactions')
+          .select('*')
+          .or(`idempotency_key.eq.${key},opay_reference.eq.${key},provider_reference.eq.${key}`)
+          .limit(1)
+          .single();
+
+        if (existingTx) {
+          return { ...existingTx, isDuplicate: true };
+        }
+      }
+
       // 2. If modern insert failed (e.g. unknown columns user_id / idempotency_key), fallback to migration MVP schema
       if (error) {
         logger.warn({ error: error.message }, 'Standard transaction insert failed; trying MVP schema compatibility...');

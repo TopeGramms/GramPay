@@ -211,6 +211,18 @@ JSON Output Contract (STRICT JSON ONLY, NO MARKDOWN):
       }
     }
 
+    // Fallback: extract target name from "to [Name]" or "for [Name]" if not in saved contacts
+    if (!recipientName && !accountNumber) {
+      const toMatch = cleaned.match(/\b(?:to|for)\s+([A-Za-z]+)\b/i);
+      if (toMatch) {
+        const candidate = toMatch[1].trim();
+        const reserved = ['my', 'me', 'account', 'bank', 'the', 'this', 'a', 'an', 'someone', 'opay', 'kuda', 'moniepoint', 'palmpay', 'gtb', 'gtbank', 'zenith', 'uba', 'access', 'firstbank'];
+        if (!reserved.includes(candidate.toLowerCase())) {
+          recipientName = candidate.charAt(0).toUpperCase() + candidate.slice(1).toLowerCase();
+        }
+      }
+    }
+
     // 9. If amount or intent keywords present -> SEND_MONEY intent
     if (amount || accountNumber || bankName || recipientName || lower.includes('send') || lower.includes('transfer')) {
       return {
@@ -226,31 +238,69 @@ JSON Output Contract (STRICT JSON ONLY, NO MARKDOWN):
   }
 
   /**
-   * Conversational natural language response generator
+   * Conversational natural language response generator with memory
    */
-  async generateResponse(userMessage, context = '') {
+  async generateResponse(userMessage, context = '', history = [], userName = null) {
+    const greetingName = userName ? ` The user's name is ${userName}.` : '';
+    const cleanLower = userMessage.toLowerCase().trim();
+
+    // Natural fast fallbacks for common pleasantries
+    if (cleanLower.includes('how are you') || cleanLower.includes('how you doing') || cleanLower.includes('how far')) {
+      return userName
+        ? `I'm doing well, ${userName}! 😊 How can I help you with your account today?`
+        : `I'm doing great, thanks for asking! 😊 How can I help you today?`;
+    }
+    if (cleanLower === 'thanks' || cleanLower === 'thank you' || cleanLower.includes('thank you so much')) {
+      return userName
+        ? `You're welcome, ${userName}! 🚀 Let me know if you need to make any transfers.`
+        : `You're very welcome! Let me know if you need anything else.`;
+    }
+
+    const defaultFallback = userName
+      ? `Hey ${userName}! 👋 I'm here to help. You can tell me to send money, check your balance, or view contacts.`
+      : 'Hello! I am GramPay, your personal account manager. You can send money, check your limits, or manage contacts!';
+
     if (!this.client) {
-      return 'I am GramPay, your smart WhatsApp money assistant. Say "send 5000 to Mom" or reply "help" to get started!';
+      return defaultFallback;
     }
 
     try {
+      const messages = [
+        {
+          role: 'system',
+          content: `You are GramPay, an intelligent, friendly, and ultra-fast personal account manager on WhatsApp in Nigeria.${greetingName} Keep your replies concise (max 1-2 sentences), warm, and natural. If asked what you can do, mention instant bank transfers, checking balance, and saving contacts. Never use markdown headers.`
+        }
+      ];
+
+      if (context) {
+        messages.push({ role: 'system', content: `Context: ${context}` });
+      }
+
+      // Append recent conversation history (user & assistant turns)
+      if (Array.isArray(history) && history.length > 0) {
+        for (const item of history.slice(-6)) {
+          if (item.content && (item.role === 'user' || item.role === 'assistant')) {
+            messages.push({
+              role: item.role,
+              content: item.content
+            });
+          }
+        }
+      }
+
+      messages.push({ role: 'user', content: userMessage });
+
       const completion = await this.client.chat.completions.create({
-        messages: [
-          { 
-            role: 'system', 
-            content: 'You are GramPay, a polite, quick, Nigerian financial AI assistant on WhatsApp. Keep responses short (max 2 sentences), warm, and helpful.' 
-          },
-          { role: 'system', content: `Context: ${context}` },
-          { role: 'user', content: userMessage }
-        ],
+        messages,
         model: this.model,
         temperature: 0.7,
         max_tokens: 120,
       });
 
-      return completion.choices[0]?.message?.content || 'How can I assist you with your transfers today?';
+      return completion.choices[0]?.message?.content || defaultFallback;
     } catch (error) {
-      return 'GramPay is ready! Send "send 5000 to Mom" or "help" to see what I can do.';
+      logger.error({ error: error.message }, 'Groq generateResponse error');
+      return defaultFallback;
     }
   }
 }

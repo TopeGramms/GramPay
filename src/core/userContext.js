@@ -33,10 +33,11 @@ export class UserContextService {
       // 3. Auto-provision user record for multi-tenancy (single-user first mode)
       const newUserPayload = {
         phone_number: cleanPhone,
-        name: `User ${cleanPhone.slice(-4)}`,
+        display_name: null,
+        onboarding_step: CONSTANTS.ONBOARDING_STEPS.AWAITING_NAME,
         daily_limit: legacyConfig?.daily_limit || CONSTANTS.DEFAULT_DAILY_LIMIT,
-        pin_hash: legacyConfig?.pin || null, // Will be migrated/hashed
-        is_active: true,
+        pin_hash: null, // New users must set their own PIN during onboarding
+        status: 'active',
       };
 
       const { data: newUser, error: insertError } = await supabase
@@ -51,19 +52,23 @@ export class UserContextService {
         return {
           id: cleanPhone,
           phone_number: cleanPhone,
+          display_name: null,
+          onboarding_step: CONSTANTS.ONBOARDING_STEPS.AWAITING_NAME,
           daily_limit: CONSTANTS.DEFAULT_DAILY_LIMIT,
           pin_hash: null,
           is_active: true,
         };
       }
 
-      logger.info({ userId: newUser.id, cleanPhone }, 'Auto-provisioned new user account');
+      logger.info({ userId: newUser.id || newUser.phone_number, cleanPhone }, 'Auto-provisioned new user account');
       return newUser;
     } catch (err) {
       logger.error({ phoneNumber, err: err.message }, 'User Context Resolution Error');
       return {
         id: cleanPhone,
         phone_number: cleanPhone,
+        display_name: null,
+        onboarding_step: CONSTANTS.ONBOARDING_STEPS.AWAITING_NAME,
         daily_limit: CONSTANTS.DEFAULT_DAILY_LIMIT,
         pin_hash: null,
         is_active: true,
@@ -74,13 +79,24 @@ export class UserContextService {
   /**
    * Update user PIN hash in database
    */
-  async updateUserPin(userId, pinHash) {
+  async updateUserPin(userIdOrPhone, pinHash) {
+    const cleanPhone = String(userIdOrPhone || '').replace(/\D/g, '');
     try {
-      // Update beta_users
-      await supabase
-        .from('beta_users')
-        .update({ pin_hash: pinHash })
-        .eq('id', userId);
+      // Update beta_users by phone_number
+      if (cleanPhone) {
+        await supabase
+          .from('beta_users')
+          .update({ pin_hash: pinHash })
+          .eq('phone_number', cleanPhone);
+      }
+
+      // Also try by id if it's a uuid
+      if (userIdOrPhone && userIdOrPhone !== cleanPhone) {
+        await supabase
+          .from('beta_users')
+          .update({ pin_hash: pinHash })
+          .eq('id', userIdOrPhone);
+      }
 
       // Also sync bot_config for single-user backward compatibility if needed
       await supabase
@@ -90,7 +106,76 @@ export class UserContextService {
 
       return true;
     } catch (err) {
-      logger.error({ userId, err: err.message }, 'Failed to update user PIN');
+      logger.error({ userIdOrPhone, err: err.message }, 'Failed to update user PIN');
+      return false;
+    }
+  }
+
+  /**
+   * Update user onboarding step
+   */
+  async updateOnboardingStep(phoneNumber, step) {
+    const cleanPhone = String(phoneNumber || '').replace(/\D/g, '');
+    if (!cleanPhone) return false;
+
+    try {
+      const { error } = await supabase
+        .from('beta_users')
+        .update({ onboarding_step: step, updated_at: new Date().toISOString() })
+        .eq('phone_number', cleanPhone);
+
+      if (error) {
+        logger.warn({ error: error.message, cleanPhone, step }, 'Failed to update onboarding step in DB');
+      }
+      return true;
+    } catch (err) {
+      logger.error({ cleanPhone, err: err.message }, 'Error updating onboarding step');
+      return false;
+    }
+  }
+
+  /**
+   * Update user display name
+   */
+  async updateDisplayName(phoneNumber, displayName) {
+    const cleanPhone = String(phoneNumber || '').replace(/\D/g, '');
+    if (!cleanPhone || !displayName) return false;
+
+    try {
+      const { error } = await supabase
+        .from('beta_users')
+        .update({ display_name: displayName, updated_at: new Date().toISOString() })
+        .eq('phone_number', cleanPhone);
+
+      if (error) {
+        logger.warn({ error: error.message, cleanPhone, displayName }, 'Failed to update display name in DB');
+      }
+      return true;
+    } catch (err) {
+      logger.error({ cleanPhone, err: err.message }, 'Error updating display name');
+      return false;
+    }
+  }
+  /**
+   * Reset user onboarding state (allows restarting the welcome & pin setup)
+   */
+  async resetUserOnboarding(phoneNumber) {
+    const cleanPhone = String(phoneNumber || '').replace(/\D/g, '');
+    if (!cleanPhone) return false;
+
+    try {
+      await supabase
+        .from('beta_users')
+        .update({
+          display_name: null,
+          pin_hash: null,
+          onboarding_step: CONSTANTS.ONBOARDING_STEPS.AWAITING_NAME,
+          updated_at: new Date().toISOString()
+        })
+        .eq('phone_number', cleanPhone);
+      return true;
+    } catch (err) {
+      logger.error({ cleanPhone, err: err.message }, 'Error resetting user onboarding');
       return false;
     }
   }

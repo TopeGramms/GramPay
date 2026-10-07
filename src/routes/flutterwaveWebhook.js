@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { paymentService } from '../services/payment.js';
 import { transactionService } from '../services/transaction.js';
+import { dedupService } from '../services/dedup.js';
 import { logger } from '../lib/logger.js';
 
 const router = Router();
@@ -18,6 +19,14 @@ router.post('/api/flutterwave/webhook', async (req, res) => {
 
   const { event, data } = req.body || {};
   logger.info({ event, dataId: data?.id, status: data?.status }, 'Received Flutterwave webhook');
+
+  // Replay protection: deduplicate webhook events
+  const eventId = String(data?.id || data?.reference || `${event}_${data?.status}`);
+  const isNew = await dedupService.checkAndRecordWebhookEvent(eventId, 'flutterwave', event, data?.reference, req.body);
+  if (!isNew) {
+    logger.info({ eventId }, 'Skipping already processed Flutterwave webhook event');
+    return;
+  }
 
   if (event === 'transfer.completed') {
     const flwRef = data.reference;

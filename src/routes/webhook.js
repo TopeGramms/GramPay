@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { config } from '../config/env.js';
 import { commandHandler } from '../core/commandHandler.js';
+import { dedupService } from '../services/dedup.js';
 import { logger } from '../lib/logger.js';
 import { verifyMetaSignature } from '../middleware/metaSignature.js';
 
@@ -53,6 +54,13 @@ router.post('/webhook', verifyMetaSignature, async (req, res) => {
     const msg = messages[0];
     const from = msg.from; // User phone number
     const messageId = msg.id;
+
+    // Replay protection: check if message was already processed
+    const isNew = await dedupService.checkAndRecordInboundMessage(messageId, from);
+    if (!isNew) {
+      logger.info({ messageId, from }, 'Dropping replayed Meta WhatsApp message');
+      return;
+    }
 
     let textContent = '';
 

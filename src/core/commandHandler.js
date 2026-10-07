@@ -5,6 +5,7 @@ import { recipientService } from '../services/recipient.js';
 import { transactionService } from '../services/transaction.js';
 import { PinService } from '../services/pin.js';
 import { userContextService } from './userContext.js';
+import { conversationMemory } from '../services/conversationMemory.js';
 import { CONSTANTS } from '../config/constants.js';
 import { logger } from '../lib/logger.js';
 
@@ -12,6 +13,42 @@ import { logger } from '../lib/logger.js';
 const pendingSessions = new Map();
 
 export class CommandHandler {
+  /**
+   * Helper to send response via WhatsApp and persist into conversation memory
+   */
+  async sendReply(to, text, buttons = null) {
+    const cleanTo = String(to).replace(/\D/g, '');
+
+    // Persist assistant message in long-term conversation history
+    conversationMemory.recordMessage({
+      phone: cleanTo,
+      role: 'assistant',
+      content: text,
+      metadata: buttons ? { buttons: buttons.map(b => b.title) } : {},
+    }).catch(() => {});
+
+    if (buttons && Array.isArray(buttons) && buttons.length > 0) {
+      return whatsappService.sendInteractiveButtons(cleanTo, text, buttons);
+    }
+    return whatsappService.sendMessage(cleanTo, text);
+  }
+
+  /**
+   * Check if a user has completed the onboarding journey.
+   * A user is only fully onboarded if they completed the steps
+   * and have both a display name and a pin hash.
+   */
+  isUserOnboarded(user) {
+    if (!user) return false;
+    if (user.onboarding_step === CONSTANTS.ONBOARDING_STEPS.COMPLETED) {
+      return true;
+    }
+    if (user.display_name && user.pin_hash) {
+      return true;
+    }
+    return false;
+  }
+
   /**
    * Main entry point for incoming WhatsApp messages
    */
@@ -29,31 +66,94 @@ export class CommandHandler {
     const logText = isPotentialPin ? '****' : cleanText.replace(/\b\d{10}\b/g, (acc) => `******${acc.slice(-4)}`);
     logger.info({ from: cleanFrom, text: logText }, '📩 Processing incoming WhatsApp message');
 
+    // Persist incoming user message into long-term conversation memory
+    conversationMemory.recordMessage({
+      phone: cleanFrom,
+      role: 'user',
+      content: cleanText,
+    }).catch(() => {});
+
     // 1. Resolve User Context
     const user = await userContextService.resolveUser(cleanFrom);
-    if (!user || !user.is_active) {
-      await whatsappService.sendMessage(cleanFrom, '⚠️ Your account is currently inactive. Please contact support.');
+    // Support both legacy `is_active` (bool) and new `status` ('frozen') field
+    const isInactive = !user || user.status === 'frozen' || user.is_active === false;
+    if (isInactive) {
+      await this.sendReply(cleanFrom, '⚠️ Your account is currently inactive. Please contact support.');
       return;
     }
 
-    // 2. Fetch User Recipients
-    const recipients = await recipientService.getRecipients(user.id);
+    const lower = cleanText.toLowerCase().trim();
 
-    // 3. Check for Active Multi-Step Guided Session
+    // 2. Allow user to reset / restart onboarding anytime
+    if (['reset', 'restart', 'register', 'onboard', 'setup'].includes(lower)) {
+      pendingSessions.delete(cleanFrom);
+      await userContextService.resetUserOnboarding(cleanFrom);
+      user.display_name = null;
+      user.pin_hash = null;
+      user.onboarding_step = CONSTANTS.ONBOARDING_STEPS.AWAITING_NAME;
+      await this.handleOnboardingEntry(cleanFrom, cleanText, user);
+      return;
+    }
+
+    // 3. Check for Active Multi-Step Session
     const activeSession = pendingSessions.get(cleanFrom);
     if (activeSession) {
       // Check session expiry (5 minutes)
       if (Date.now() - activeSession.timestamp > CONSTANTS.CONFIRMATION_TTL_MS) {
         pendingSessions.delete(cleanFrom);
-        await whatsappService.sendMessage(cleanFrom, '⏳ Session timed out. Let\'s start your request again.');
+        await this.sendReply(cleanFrom, '⏳ Session timed out. Let\'s start your request again.');
         return;
       }
 
+      // Check if session is an onboarding step
+      if (activeSession.state && activeSession.state.startsWith('ONBOARDING_')) {
+        await this.handleOnboardingSession(cleanFrom, cleanText, user, activeSession);
+        return;
+      }
+
+      const recipients = await recipientService.getRecipients(user.id);
       await this.handleActiveSession(cleanFrom, cleanText, user, activeSession, messageId, recipients);
       return;
     }
 
-    // 4. Parse Intent & Entities
+    // 4. User Onboarding Flow: If user is new / not onboarded, guide them
+    if (!this.isUserOnboarded(user)) {
+      await this.handleOnboardingEntry(cleanFrom, cleanText, user);
+      return;
+    }
+
+    // 5. Returning User Greeting Check (hi / hello / hey / start / menu)
+    if (['hi', 'hello', 'hey', 'start', 'menu', 'home'].includes(lower)) {
+      await this.sendHomeMenu(cleanFrom, user);
+      return;
+    }
+
+    // 6. Handle quick-reply buttons and common top-level triggers
+    if (['send money', '💸 send money', 'btn_send_money', 'transfer'].includes(lower)) {
+      pendingSessions.set(cleanFrom, {
+        state: 'AWAITING_RECIPIENT',
+        timestamp: Date.now(),
+      });
+      await this.sendReply(
+        cleanFrom,
+        'Which account number or saved contact would you like to transfer to?'
+      );
+      return;
+    }
+    if (['check balance', '📊 check balance', 'btn_check_balance', 'balance'].includes(lower)) {
+      await this.handleCheckBalance(cleanFrom, user);
+      return;
+    }
+    if (['my contacts', '👥 my contacts', 'btn_my_contacts', 'contacts', 'list contacts'].includes(lower)) {
+      const recipients = await recipientService.getRecipients(user.id);
+      await this.handleListRecipients(cleanFrom, recipients);
+      return;
+    }
+
+    // 5. Fetch User Recipients
+    const recipients = await recipientService.getRecipients(user.id);
+
+    // 6. Parse Intent & Entities
     const parsed = await aiService.parseCommand(cleanText, recipients);
     logger.info({ from: cleanFrom, intent: parsed.intent, parsed }, 'AI Command Parsed');
 
@@ -85,12 +185,15 @@ export class CommandHandler {
         break;
 
       case CONSTANTS.INTENTS.HELP:
-        await this.sendHelpMessage(cleanFrom);
+        // Route 'help' intent to the clean home menu with buttons (like Xara)
+        await this.sendHomeMenu(cleanFrom, user);
         break;
 
       default:
-        const response = await aiService.generateResponse(cleanText);
-        await whatsappService.sendMessage(cleanFrom, response);
+        // Use conversation memory for context-aware response
+        const history = await conversationMemory.getRecentHistory(cleanFrom, 6);
+        const response = await aiService.generateResponse(cleanText, '', history, user.display_name);
+        await this.sendReply(cleanFrom, response);
         break;
     }
   }
@@ -104,7 +207,7 @@ export class CommandHandler {
     // Global Cancel
     if (['no', 'cancel', 'stop', 'abort', 'don\'t', 'dont', 'exit'].includes(lower)) {
       pendingSessions.delete(from);
-      await whatsappService.sendMessage(from, '❌ Transfer request cancelled.');
+      await this.sendReply(from, '❌ Transfer request cancelled.');
       return;
     }
 
@@ -147,7 +250,7 @@ export class CommandHandler {
         return;
       }
 
-      await whatsappService.sendMessage(
+      await this.sendReply(
         from,
         `🔍 Could not find "${text}" in your saved contacts.\n\nPlease reply with an **Account Number and Bank Name** (e.g. \`0123456789 Opay\`), or say *cancel*.`
       );
@@ -165,7 +268,7 @@ export class CommandHandler {
         return;
       }
 
-      await whatsappService.sendMessage(from, '❓ Please enter a valid transfer amount (e.g., `5000` or `5k`):');
+      await this.sendReply(from, '❓ Please enter a valid transfer amount (e.g., `5000` or `5k`):');
       return;
     }
 
@@ -175,7 +278,7 @@ export class CommandHandler {
     if (session.state === 'AWAITING_BANK_SELECTION') {
       const bankCode = await paymentService.resolveBankCode(text);
       if (!bankCode) {
-        await whatsappService.sendMessage(
+        await this.sendReply(
           from,
           `❓ Could not recognize bank "${text}". Please select or reply with a valid bank name (e.g., Opay, Kuda, Moniepoint, GTBank, Zenith):`
         );
@@ -196,7 +299,7 @@ export class CommandHandler {
         if (!user.pin_hash) {
           session.state = 'SETTING_PIN_FIRST';
           pendingSessions.set(from, session);
-          await whatsappService.sendMessage(from, '🔐 You have not set a 4-digit PIN yet.\nPlease enter a new 4-digit PIN to secure your transfers:');
+          await this.sendReply(from, '🔐 You have not set a 4-digit PIN yet.\nPlease enter a new 4-digit PIN to secure your transfers:');
           return;
         }
 
@@ -204,14 +307,14 @@ export class CommandHandler {
         session.pinAttempts = 0;
         pendingSessions.set(from, session);
 
-        await whatsappService.sendMessage(
+        await this.sendReply(
           from,
           `🔒 *Security Authorization*\n\nPlease reply with your **4-digit PIN** to authorize sending **NGN ${session.amount.toLocaleString()}** to **${session.recipientName}**.`
         );
         return;
       }
 
-      await whatsappService.sendMessage(from, 'Please reply *YES* to confirm or *NO* to cancel.');
+      await this.sendReply(from, 'Please reply *YES* to confirm or *NO* to cancel.');
       return;
     }
 
@@ -220,7 +323,7 @@ export class CommandHandler {
     // -------------------------------------------------------------
     if (session.state === 'AWAITING_OLD_PIN_FOR_CHANGE') {
       if (!/^\d{4}$/.test(text)) {
-        await whatsappService.sendMessage(from, '⚠️ Please enter your current 4-digit numeric PIN:');
+        await this.sendReply(from, '⚠️ Please enter your current 4-digit numeric PIN:');
         return;
       }
 
@@ -229,16 +332,16 @@ export class CommandHandler {
         session.oldPinAttempts = (session.oldPinAttempts || 0) + 1;
         if (session.oldPinAttempts >= 3) {
           pendingSessions.delete(from);
-          await whatsappService.sendMessage(from, '🚫 Maximum invalid attempts reached. PIN change cancelled.');
+          await this.sendReply(from, '🚫 Maximum invalid attempts reached. PIN change cancelled.');
           return;
         }
-        await whatsappService.sendMessage(from, `❌ Incorrect current PIN (${3 - session.oldPinAttempts} attempt(s) remaining). Please try again:`);
+        await this.sendReply(from, `❌ Incorrect current PIN (${3 - session.oldPinAttempts} attempt(s) remaining). Please try again:`);
         return;
       }
 
       session.state = 'SETTING_PIN_FIRST';
       pendingSessions.set(from, session);
-      await whatsappService.sendMessage(from, '✅ Current PIN verified. Please enter your **new 4-digit PIN**:');
+      await this.sendReply(from, '✅ Current PIN verified. Please enter your **new 4-digit PIN**:');
       return;
     }
 
@@ -250,10 +353,10 @@ export class CommandHandler {
         session.newPinCandidate = text;
         session.state = 'CONFIRMING_NEW_PIN';
         pendingSessions.set(from, session);
-        await whatsappService.sendMessage(from, '🔐 Please **re-enter** your new 4-digit PIN to confirm:');
+        await this.sendReply(from, '🔐 Please **re-enter** your new 4-digit PIN to confirm:');
         return;
       }
-      await whatsappService.sendMessage(from, '⚠️ PIN must be exactly 4 digits. Please enter a valid 4-digit PIN:');
+      await this.sendReply(from, '⚠️ PIN must be exactly 4 digits. Please enter a valid 4-digit PIN:');
       return;
     }
 
@@ -262,7 +365,7 @@ export class CommandHandler {
     // -------------------------------------------------------------
     if (session.state === 'CONFIRMING_NEW_PIN') {
       if (!/^\d{4}$/.test(text)) {
-        await whatsappService.sendMessage(from, '⚠️ Please re-enter your 4-digit numeric PIN to confirm:');
+        await this.sendReply(from, '⚠️ Please re-enter your 4-digit numeric PIN to confirm:');
         return;
       }
 
@@ -270,7 +373,7 @@ export class CommandHandler {
         delete session.newPinCandidate;
         session.state = 'SETTING_PIN_FIRST';
         pendingSessions.set(from, session);
-        await whatsappService.sendMessage(from, '❌ PINs do not match. Let\'s try again. Please enter your new 4-digit PIN:');
+        await this.sendReply(from, '❌ PINs do not match. Let\'s try again. Please enter your new 4-digit PIN:');
         return;
       }
 
@@ -285,7 +388,7 @@ export class CommandHandler {
         await this.executeTransfer(from, user, session, messageId);
       } else {
         pendingSessions.delete(from);
-        await whatsappService.sendMessage(from, '🔐 *PIN Set Successfully!* Your new 4-digit PIN is now active.');
+        await this.sendReply(from, '🔐 *PIN Set Successfully!* Your new 4-digit PIN is now active.');
       }
       return;
     }
@@ -295,7 +398,7 @@ export class CommandHandler {
     // -------------------------------------------------------------
     if (session.state === 'AWAITING_PIN') {
       if (!/^\d{4}$/.test(text)) {
-        await whatsappService.sendMessage(from, '⚠️ Please enter your 4-digit numeric PIN:');
+        await this.sendReply(from, '⚠️ Please enter your 4-digit numeric PIN:');
         return;
       }
 
@@ -304,10 +407,10 @@ export class CommandHandler {
         session.pinAttempts = (session.pinAttempts || 0) + 1;
         if (session.pinAttempts >= 3) {
           pendingSessions.delete(from);
-          await whatsappService.sendMessage(from, '🚫 Maximum invalid PIN attempts reached. Transfer cancelled for security.');
+          await this.sendReply(from, '🚫 Maximum invalid PIN attempts reached. Transfer cancelled for security.');
           return;
         }
-        await whatsappService.sendMessage(from, `❌ Incorrect PIN (${3 - session.pinAttempts} attempt(s) remaining). Please try again:`);
+        await this.sendReply(from, `❌ Incorrect PIN (${3 - session.pinAttempts} attempt(s) remaining). Please try again:`);
         return;
       }
 
@@ -327,6 +430,7 @@ export class CommandHandler {
     let bankName = parsed.bankName;
 
     // Session accumulator object
+    const cleanFrom = from.replace(/\D/g, '');
     const session = {
       state: 'INIT',
       amount,
@@ -335,12 +439,12 @@ export class CommandHandler {
       bankName,
       bankCode: null,
       timestamp: Date.now(),
-      idempotencyKey: `tx_${messageId || Date.now()}_${Math.floor(Math.random() * 1000)}`,
+      idempotencyKey: `tx_${cleanFrom}_${messageId || Date.now()}`,
     };
 
     // Case 1: Neither Amount nor Recipient is specified
     if (!amount && !accountNumber && !recipientName) {
-      await whatsappService.sendMessage(from, '💬 Who would you like to send money to, and how much? (e.g. "Send 5k to Mom" or "Transfer 2000 to 0123456789 Opay")');
+      await this.sendReply(from, '💬 Who would you like to send money to, and how much? (e.g. "Send 5k to Mom" or "Transfer 2000 to 0123456789 Opay")');
       return;
     }
 
@@ -355,7 +459,7 @@ export class CommandHandler {
         session.state = 'AWAITING_AMOUNT';
         pendingSessions.set(from, session);
 
-        await whatsappService.sendMessage(
+        await this.sendReply(
           from,
           `💸 How much would you like to send to **${session.recipientName}** (${found.bank_name} - ${found.account_number})?`
         );
@@ -368,7 +472,7 @@ export class CommandHandler {
       session.state = 'AWAITING_RECIPIENT';
       pendingSessions.set(from, session);
 
-      await whatsappService.sendMessage(
+      await this.sendReply(
         from,
         `💸 Got it! NGN ${amount.toLocaleString()}.\nWho are you sending this to? Reply with a contact name (e.g., Mom), or an account number & bank.`
       );
@@ -394,9 +498,10 @@ export class CommandHandler {
       } else {
         session.state = 'AWAITING_RECIPIENT';
         pendingSessions.set(from, session);
-        await whatsappService.sendMessage(
+        const amountNote = amount ? ` to send NGN ${amount.toLocaleString()}` : '';
+        await this.sendReply(
           from,
-          `🔍 Could not find "${recipientName}" in your contacts.\nTo transfer directly, please reply with an account number and bank name (e.g., \`0123456789 Opay\`).`
+          `🔍 Could not find *"${recipientName}"* in your saved contacts.\n\nPlease reply with their *10-digit account number and bank name* (e.g. \`0123456789 Opay\`)${amountNote}, or say *cancel*.`
         );
         return;
       }
@@ -416,7 +521,7 @@ export class CommandHandler {
       { id: 'btn_kuda', title: 'Kuda' },
       { id: 'btn_moniepoint', title: 'Moniepoint' },
     ];
-    await whatsappService.sendInteractiveButtons(from, text, buttons);
+    await this.sendReply(from, text, buttons);
   }
 
   /**
@@ -426,20 +531,20 @@ export class CommandHandler {
     if (!session.amount || session.amount <= 0) {
       session.state = 'AWAITING_AMOUNT';
       pendingSessions.set(from, session);
-      await whatsappService.sendMessage(from, '❓ How much would you like to transfer?');
+      await this.sendReply(from, '❓ How much would you like to transfer?');
       return;
     }
 
     // Limits Validation
     if (session.amount < CONSTANTS.MIN_SINGLE_TRANSFER) {
       pendingSessions.delete(from);
-      await whatsappService.sendMessage(from, `⚠️ Minimum single transfer limit is NGN ${CONSTANTS.MIN_SINGLE_TRANSFER.toLocaleString()}.`);
+      await this.sendReply(from, `⚠️ Minimum single transfer limit is NGN ${CONSTANTS.MIN_SINGLE_TRANSFER.toLocaleString()}.`);
       return;
     }
 
     if (session.amount > CONSTANTS.MAX_SINGLE_TRANSFER) {
       pendingSessions.delete(from);
-      await whatsappService.sendMessage(from, `⚠️ Maximum single transfer limit is NGN ${CONSTANTS.MAX_SINGLE_TRANSFER.toLocaleString()}.`);
+      await this.sendReply(from, `⚠️ Maximum single transfer limit is NGN ${CONSTANTS.MAX_SINGLE_TRANSFER.toLocaleString()}.`);
       return;
     }
 
@@ -447,7 +552,7 @@ export class CommandHandler {
     if (spentToday + session.amount > user.daily_limit) {
       pendingSessions.delete(from);
       const remaining = Math.max(0, user.daily_limit - spentToday);
-      await whatsappService.sendMessage(
+      await this.sendReply(
         from,
         `⚠️ Daily transfer limit reached!\nDaily limit: NGN ${user.daily_limit.toLocaleString()}\nSpent today: NGN ${spentToday.toLocaleString()}\nRemaining: NGN ${remaining.toLocaleString()}`
       );
@@ -467,12 +572,12 @@ export class CommandHandler {
     }
 
     // Call Flutterwave Account Verification API
-    await whatsappService.sendMessage(from, '🔍 Verifying account details with bank...');
+    await this.sendReply(from, '🔍 Verifying account details with bank...');
     const verification = await paymentService.verifyAccount(session.accountNumber, session.bankCode);
 
     if (!verification.success) {
       pendingSessions.delete(from);
-      await whatsappService.sendMessage(
+      await this.sendReply(
         from,
         `❌ Could not verify account number **${session.accountNumber}** with ${session.bankName}.\n${verification.message || 'Please check the account number and bank.'}`
       );
@@ -491,7 +596,7 @@ export class CommandHandler {
       `*Amount:* NGN ${session.amount.toLocaleString()}\n\n` +
       `Reply *YES* to proceed or *NO* to cancel.`;
 
-    await whatsappService.sendInteractiveButtons(from, confirmMsg, [
+    await this.sendReply(from, confirmMsg, [
       { id: 'btn_yes', title: 'YES' },
       { id: 'btn_no', title: 'NO' },
     ]);
@@ -501,7 +606,7 @@ export class CommandHandler {
    * Execute actual payout transfer and update single DB record
    */
   async executeTransfer(from, user, session, messageId) {
-    await whatsappService.sendMessage(from, '⏳ Processing transfer with bank...');
+    await this.sendReply(from, '⏳ Processing transfer with bank...');
 
     // 1. Single Pending DB Log with Idempotency Key
     let initialTx;
@@ -515,8 +620,23 @@ export class CommandHandler {
         idempotencyKey: session.idempotencyKey,
       });
     } catch (err) {
+      logger.error({ error: err.message }, 'Failed to log initial transaction');
+    }
+
+    if (!initialTx) {
       pendingSessions.delete(from);
-      await whatsappService.sendMessage(from, '❌ Transaction initialization failed. Money was NOT sent.');
+      await this.sendReply(from, '❌ Transaction initialization failed. Money was NOT sent.');
+      return;
+    }
+
+    // Real Idempotency Guard: If transaction was already initiated/completed, avoid duplicate payout
+    if (initialTx.isDuplicate || ['completed', 'processing'].includes(initialTx.status)) {
+      pendingSessions.delete(from);
+      logger.warn({ txId: initialTx.id, status: initialTx.status, key: session.idempotencyKey }, 'Idempotent request: transfer already initiated or completed');
+      await this.sendReply(
+        from,
+        `ℹ️ *Transfer Already Recorded*\n\nThis transaction was already initiated.\n*Status:* ${(initialTx.status || 'PROCESSING').toUpperCase()}\n*Ref:* ${initialTx.provider_reference || initialTx.opay_reference || session.idempotencyKey}`
+      );
       return;
     }
 
@@ -551,7 +671,7 @@ export class CommandHandler {
         `*Status:* ${result.status || 'PROCESSING'}\n` +
         `*Ref:* ${result.reference || result.transferId}`;
 
-      await whatsappService.sendMessage(from, successMsg);
+      await this.sendReply(from, successMsg);
     } catch (error) {
       logger.error({ error: error.message, txId: initialTx.id }, 'Payout execution error');
 
@@ -563,7 +683,7 @@ export class CommandHandler {
       const userSafeMsg = error.isOperational
         ? error.message
         : 'The transfer could not be completed by the bank. Please try again later.';
-      await whatsappService.sendMessage(from, `❌ Transfer failed: ${userSafeMsg}`);
+      await this.sendReply(from, `❌ Transfer failed: ${userSafeMsg}`);
     }
   }
 
@@ -573,19 +693,19 @@ export class CommandHandler {
   async handleAddRecipient(from, user, parsed) {
     const { recipientName, accountNumber, bankName } = parsed;
     if (!accountNumber || !bankName) {
-      await whatsappService.sendMessage(from, '❓ Please provide account number, bank name, and nickname (e.g. "Save Mom 0123456789 Kuda")');
+      await this.sendReply(from, '❓ Please provide account number, bank name, and nickname (e.g. "Save Mom 0123456789 Kuda")');
       return;
     }
 
     const bankCode = await paymentService.resolveBankCode(bankName);
     if (!bankCode) {
-      await whatsappService.sendMessage(from, `⚠️ Could not identify bank "${bankName}". Please check the bank name and try again.`);
+      await this.sendReply(from, `⚠️ Could not identify bank "${bankName}". Please check the bank name and try again.`);
       return;
     }
 
     const verification = await paymentService.verifyAccount(accountNumber, bankCode);
     if (!verification.success) {
-      await whatsappService.sendMessage(
+      await this.sendReply(
         from,
         `❌ Could not verify account ${accountNumber} with ${bankName}: ${verification.message || 'Invalid account details'}`
       );
@@ -602,7 +722,7 @@ export class CommandHandler {
       bankCode,
     });
 
-    await whatsappService.sendMessage(from, `✅ Saved *${recipientName || resolvedName}* (${resolvedName} - ${bankName}) to your contacts!`);
+    await this.sendReply(from, `✅ Saved *${recipientName || resolvedName}* (${resolvedName} - ${bankName}) to your contacts!`);
   }
 
   /**
@@ -617,7 +737,7 @@ export class CommandHandler {
       `*Spent Today:* NGN ${spentToday.toLocaleString()}\n` +
       `*Remaining Today:* NGN ${remaining.toLocaleString()}`;
 
-    await whatsappService.sendMessage(from, msg);
+    await this.sendReply(from, msg);
   }
 
   /**
@@ -625,7 +745,7 @@ export class CommandHandler {
    */
   async handleListRecipients(from, recipients) {
     if (!recipients || recipients.length === 0) {
-      await whatsappService.sendMessage(from, '📋 You have no saved contacts. To save one, say:\n"Save Mom 0123456789 Kuda"');
+      await this.sendReply(from, '📋 You have no saved contacts. To save one, say:\n"Save Mom 0123456789 Kuda"');
       return;
     }
 
@@ -634,7 +754,7 @@ export class CommandHandler {
       msg += `${i + 1}. *${r.nickname || r.name}*: ${r.account_number} (${r.bank_name})\n`;
     });
 
-    await whatsappService.sendMessage(from, msg);
+    await this.sendReply(from, msg);
   }
 
   /**
@@ -647,7 +767,7 @@ export class CommandHandler {
         timestamp: Date.now(),
         oldPinAttempts: 0,
       });
-      await whatsappService.sendMessage(from, '🔒 To change your PIN, please enter your **current 4-digit PIN**:');
+      await this.sendReply(from, '🔒 To change your PIN, please enter your **current 4-digit PIN**:');
       return;
     }
 
@@ -656,7 +776,7 @@ export class CommandHandler {
       timestamp: Date.now(),
     });
 
-    await whatsappService.sendMessage(from, '🔐 Please enter your new 4-digit PIN:');
+    await this.sendReply(from, '🔐 Please enter your new 4-digit PIN:');
   }
 
   /**
@@ -669,26 +789,326 @@ export class CommandHandler {
     }
 
     // Do NOT set PIN from an unsolicited 4-digit number
-    await whatsappService.sendMessage(
+    await this.sendReply(
       from,
       'ℹ️ If you want to change your PIN, please say *"Set PIN"*. Otherwise, tell me what you would like to do (e.g., *"Send 5000 to Mom"*).'
     );
   }
 
   /**
-   * Help menu
+   * The main home menu — clean Xara-style greeting with action buttons.
+   * Used for greetings, 'help', 'hi', 'menu', and returning users.
    */
-  async sendHelpMessage(from) {
-    const helpMsg = `👋 *Welcome to GramPay!* Your AI Money Transfer Assistant.\n\n` +
-      `You can chat naturally with me, for example:\n` +
-      `• *"Send 5000 to Mom"*\n` +
-      `• *"Transfer 2000 to 0123456789 Opay"*\n` +
-      `• *"Send 4k"*\n` +
-      `• *"Save Bro 0581234567 GTBank"*\n` +
-      `• *"Check limits"*\n` +
-      `• *"Set PIN"*\n`;
+  async sendHomeMenu(from, user) {
+    const name = user?.display_name ? ` ${user.display_name}` : '';
+    const msg = `Hello${name}! I'm GramPay, your personal account manager. I can help you with transfers, airtime, checking balance, and managing beneficiaries. How can I assist you today?`;
 
-    await whatsappService.sendMessage(from, helpMsg);
+    await this.sendReply(from, msg, [
+      { id: 'btn_send_money', title: 'Send money' },
+      { id: 'btn_check_balance', title: 'Check balance' },
+      { id: 'btn_my_contacts', title: 'My contacts' },
+    ]);
+  }
+
+  /**
+   * Backward-compat alias — routes old sendHelpMessage/sendWelcomeBackMessage callers to sendHomeMenu
+   */
+  async sendWelcomeBackMessage(from, user) {
+    return this.sendHomeMenu(from, user);
+  }
+
+  async sendHelpMessage(from, user = null) {
+    return this.sendHomeMenu(from, user);
+  }
+
+  /**
+   * Entry point for new users into the onboarding workflow.
+   * Fires for truly new users (no pin_hash and no onboarding_step).
+   */
+  async handleOnboardingEntry(from, text, user) {
+    pendingSessions.set(from, {
+      state: 'ONBOARDING_AWAITING_NAME',
+      timestamp: Date.now(),
+    });
+    await userContextService.updateOnboardingStep(from, CONSTANTS.ONBOARDING_STEPS.AWAITING_NAME);
+
+    const welcomeMsg = `👋 Hello! Welcome to *GramPay*, your personal account manager on WhatsApp.\n\n` +
+      `I make sending money to any Nigerian bank as fast and simple as sending a chat message.\n\n` +
+      `Let's get your account set up in under a minute! 🚀\n\n` +
+      `First, *what is your name?*`;
+
+    await this.sendReply(from, welcomeMsg);
+  }
+
+  /**
+   * Guided multi-turn onboarding state machine
+   */
+  async handleOnboardingSession(from, text, user, session) {
+    const lower = text.toLowerCase().trim();
+
+    // 1. STATE: ONBOARDING_AWAITING_NAME
+    if (session.state === 'ONBOARDING_AWAITING_NAME') {
+      let rawName = text.replace(/^(my name is|i am|call me|it's|its)\s+/i, '').trim();
+      rawName = rawName.split(/\s+/).slice(0, 2).join(' ');
+
+      if (!rawName || rawName.length < 2 || rawName.length > 30) {
+        await this.sendReply(from, '❓ Please tell me your name or nickname to get started:');
+        return;
+      }
+
+      const formattedName = rawName.charAt(0).toUpperCase() + rawName.slice(1);
+      await userContextService.updateDisplayName(from, formattedName);
+      await userContextService.updateOnboardingStep(from, CONSTANTS.ONBOARDING_STEPS.SETTING_PIN_FIRST);
+      user.display_name = formattedName;
+
+      session.displayName = formattedName;
+      session.state = 'ONBOARDING_SETTING_PIN';
+      session.timestamp = Date.now();
+      pendingSessions.set(from, session);
+
+      const msg = `Nice to meet you, *${formattedName}*! 🎉\n\n` +
+        `Now let's secure your transfers. Please create a **4-digit PIN** that you'll use to authorize payments (e.g., \`1234\`):`;
+      await this.sendReply(from, msg);
+      return;
+    }
+
+    // 2. STATE: ONBOARDING_SETTING_PIN
+    if (session.state === 'ONBOARDING_SETTING_PIN') {
+      if (!/^\d{4}$/.test(text)) {
+        await this.sendReply(from, '⚠️ Your PIN must be exactly 4 digits (e.g., `1234`). Please enter a 4-digit PIN:');
+        return;
+      }
+
+      session.pinCandidate = text;
+      session.state = 'ONBOARDING_CONFIRMING_PIN';
+      session.timestamp = Date.now();
+      pendingSessions.set(from, session);
+      await userContextService.updateOnboardingStep(from, CONSTANTS.ONBOARDING_STEPS.CONFIRMING_NEW_PIN);
+
+      await this.sendReply(from, '🔐 Please **re-enter** your 4-digit PIN to confirm:');
+      return;
+    }
+
+    // 3. STATE: ONBOARDING_CONFIRMING_PIN
+    if (session.state === 'ONBOARDING_CONFIRMING_PIN') {
+      if (!/^\d{4}$/.test(text)) {
+        await this.sendReply(from, '⚠️ Please re-enter your 4-digit numeric PIN:');
+        return;
+      }
+
+      if (text !== session.pinCandidate) {
+        delete session.pinCandidate;
+        session.state = 'ONBOARDING_SETTING_PIN';
+        session.timestamp = Date.now();
+        pendingSessions.set(from, session);
+        await this.sendReply(from, '❌ PINs do not match. Let\'s try again. Please enter your new 4-digit PIN:');
+        return;
+      }
+
+      const hash = await PinService.hashPin(text);
+      await userContextService.updateUserPin(from, hash);
+      user.pin_hash = hash;
+      delete session.pinCandidate;
+
+      session.state = 'ONBOARDING_OFFER_BENEFICIARY';
+      session.timestamp = Date.now();
+      pendingSessions.set(from, session);
+      await userContextService.updateOnboardingStep(from, CONSTANTS.ONBOARDING_STEPS.OFFER_BENEFICIARY);
+
+      const offerMsg = `✅ *Security PIN created successfully!* 🔒\n\n` +
+        `Would you like to save a beneficiary contact now? (e.g., Mom, Bro, Landlord)\n\n` +
+        `Saving contacts allows you to make instant transfers like *"Send 5k to Mom"* without typing account numbers every time!`;
+
+      await this.sendReply(from, offerMsg, [
+        { id: 'btn_beneficiary_yes', title: 'Yes, save one' },
+        { id: 'btn_beneficiary_skip', title: 'Skip for now' },
+      ]);
+      return;
+    }
+
+    // 4. STATE: ONBOARDING_OFFER_BENEFICIARY
+    if (session.state === 'ONBOARDING_OFFER_BENEFICIARY') {
+      if (['yes', 'yup', 'yeah', 'yes, save one', '1', 'sure', 'proceed', 'save'].includes(lower)) {
+        session.state = 'ONBOARDING_BENEFICIARY_NICKNAME';
+        session.timestamp = Date.now();
+        pendingSessions.set(from, session);
+        await userContextService.updateOnboardingStep(from, CONSTANTS.ONBOARDING_STEPS.AWAITING_BENEFICIARY_NICKNAME);
+
+        await this.sendReply(from, 'Great! What nickname or label would you like to give them? (e.g., *Mom*, *Bro*, *Chinedu*):');
+        return;
+      }
+
+      if (['no', 'skip', 'skip for now', 'later', '2', 'cancel', 'nah'].includes(lower)) {
+        await this.completeOnboarding(from, session.displayName || user.display_name);
+        return;
+      }
+
+      await this.sendReply(from, 'Please choose an option below:', [
+        { id: 'btn_beneficiary_yes', title: 'Yes, save one' },
+        { id: 'btn_beneficiary_skip', title: 'Skip for now' },
+      ]);
+      return;
+    }
+
+    // 5. STATE: ONBOARDING_BENEFICIARY_NICKNAME
+    if (session.state === 'ONBOARDING_BENEFICIARY_NICKNAME') {
+      const cleanNick = text.replace(/^(save|add|my|call them|nickname is)\s+/i, '').trim();
+      if (!cleanNick) {
+        await this.sendReply(from, '❓ Please provide a nickname for this contact (e.g., *Mom*):');
+        return;
+      }
+
+      session.beneficiaryNickname = cleanNick;
+      session.state = 'ONBOARDING_BENEFICIARY_ACCOUNT';
+      session.timestamp = Date.now();
+      pendingSessions.set(from, session);
+      await userContextService.updateOnboardingStep(from, CONSTANTS.ONBOARDING_STEPS.AWAITING_BENEFICIARY_ACCOUNT);
+
+      await this.sendReply(from, `Got it for *${cleanNick}*! 💳\n\nPlease enter their **10-digit Nigerian account number**:`);
+      return;
+    }
+
+    // 6. STATE: ONBOARDING_BENEFICIARY_ACCOUNT
+    if (session.state === 'ONBOARDING_BENEFICIARY_ACCOUNT') {
+      const accMatch = text.match(/\b(\d{10})\b/);
+      if (!accMatch) {
+        await this.sendReply(from, '⚠️ Please enter a valid 10-digit account number (e.g. `0123456789`):');
+        return;
+      }
+
+      session.beneficiaryAccount = accMatch[1];
+
+      // Check if bank name was typed alongside
+      const knownBanks = ['opay', 'kuda', 'moniepoint', 'palmpay', 'gtb', 'gtbank', 'zenith', 'access', 'first bank', 'uba', 'fcmb', 'stanbic', 'sterling', 'wema'];
+      let foundBank = null;
+      for (const b of knownBanks) {
+        if (lower.includes(b)) {
+          foundBank = b;
+          break;
+        }
+      }
+
+      if (foundBank) {
+        session.beneficiaryBank = foundBank;
+        await this.verifyAndSaveOnboardingBeneficiary(from, user, session);
+        return;
+      }
+
+      session.state = 'ONBOARDING_BENEFICIARY_BANK';
+      session.timestamp = Date.now();
+      pendingSessions.set(from, session);
+      await userContextService.updateOnboardingStep(from, CONSTANTS.ONBOARDING_STEPS.AWAITING_BENEFICIARY_BANK);
+
+      await this.sendReply(
+        from,
+        `🏦 Which bank is **${session.beneficiaryAccount}** with? Reply with the bank name (or choose below):`,
+        [
+          { id: 'btn_ob_opay', title: 'Opay' },
+          { id: 'btn_ob_kuda', title: 'Kuda' },
+          { id: 'btn_ob_moniepoint', title: 'Moniepoint' },
+        ]
+      );
+      return;
+    }
+
+    // 7. STATE: ONBOARDING_BENEFICIARY_BANK
+    if (session.state === 'ONBOARDING_BENEFICIARY_BANK') {
+      session.beneficiaryBank = text;
+      await this.verifyAndSaveOnboardingBeneficiary(from, user, session);
+      return;
+    }
+
+    // 8. STATE: ONBOARDING_ASK_ADD_ANOTHER
+    if (session.state === 'ONBOARDING_ASK_ADD_ANOTHER') {
+      if (['yes', 'save another', '1', 'add another', 'another'].includes(lower)) {
+        session.state = 'ONBOARDING_BENEFICIARY_NICKNAME';
+        delete session.beneficiaryNickname;
+        delete session.beneficiaryAccount;
+        delete session.beneficiaryBank;
+        session.timestamp = Date.now();
+        pendingSessions.set(from, session);
+
+        await this.sendReply(from, 'Great! What is the next recipient\'s nickname? (e.g., *Bro*, *Dad*):');
+        return;
+      }
+
+      if (['no', 'i\'m all set', 'im all set', 'done', 'finish', 'skip', '2'].includes(lower)) {
+        await this.completeOnboarding(from, session.displayName || user.display_name);
+        return;
+      }
+
+      await this.sendReply(from, 'Would you like to save another contact?', [
+        { id: 'btn_ob_another', title: 'Save another' },
+        { id: 'btn_ob_done', title: "I'm all set" },
+      ]);
+      return;
+    }
+  }
+
+  /**
+   * Verify beneficiary account with Flutterwave and save to contacts
+   */
+  async verifyAndSaveOnboardingBeneficiary(from, user, session) {
+    const bankCode = await paymentService.resolveBankCode(session.beneficiaryBank);
+    if (!bankCode) {
+      await this.sendReply(
+        from,
+        `❓ Could not recognize bank "${session.beneficiaryBank}". Please reply with a valid bank name (e.g., Opay, Kuda, Moniepoint, GTBank, Zenith):`
+      );
+      return;
+    }
+
+    await this.sendReply(from, '🔍 Verifying account details with bank...');
+    const verification = await paymentService.verifyAccount(session.beneficiaryAccount, bankCode);
+
+    if (!verification.success) {
+      await this.sendReply(
+        from,
+        `❌ Could not verify account **${session.beneficiaryAccount}** with ${session.beneficiaryBank}.\n${verification.message || 'Please check the account number and bank.'}\n\nPlease enter the correct account number:`
+      );
+      session.state = 'ONBOARDING_BENEFICIARY_ACCOUNT';
+      session.timestamp = Date.now();
+      pendingSessions.set(from, session);
+      return;
+    }
+
+    const resolvedName = verification.accountName || session.beneficiaryNickname;
+
+    await recipientService.addRecipient(user.id || from, {
+      name: resolvedName,
+      nickname: session.beneficiaryNickname,
+      accountNumber: session.beneficiaryAccount,
+      bankName: session.beneficiaryBank,
+      bankCode,
+    });
+
+    session.state = 'ONBOARDING_ASK_ADD_ANOTHER';
+    session.timestamp = Date.now();
+    pendingSessions.set(from, session);
+
+    const successMsg = `✅ Saved *${session.beneficiaryNickname}* (${resolvedName} - ${session.beneficiaryBank.toUpperCase()})!\n\nWould you like to save another beneficiary?`;
+    await this.sendReply(from, successMsg, [
+      { id: 'btn_ob_another', title: 'Save another' },
+      { id: 'btn_ob_done', title: "I'm all set" },
+    ]);
+  }
+
+  /**
+   * Complete onboarding and send congratulatory overview
+   */
+  async completeOnboarding(from, displayName) {
+    pendingSessions.delete(from);
+    await userContextService.updateOnboardingStep(from, CONSTANTS.ONBOARDING_STEPS.COMPLETED);
+
+    const name = displayName ? ` ${displayName}` : '';
+    const completionMsg = `🎉 *You're all set up${name}!* Welcome to GramPay.\n\n` +
+      `Your account is active and ready for transfers. How can I assist you today?`;
+
+    await this.sendReply(from, completionMsg, [
+      { id: 'btn_send_money', title: 'Send money' },
+      { id: 'btn_check_balance', title: 'Check balance' },
+      { id: 'btn_my_contacts', title: 'My contacts' },
+    ]);
   }
 }
 
