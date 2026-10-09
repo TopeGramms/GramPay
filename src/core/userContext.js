@@ -81,29 +81,17 @@ export class UserContextService {
    */
   async updateUserPin(userIdOrPhone, pinHash) {
     const cleanPhone = String(userIdOrPhone || '').replace(/\D/g, '');
+    if (!cleanPhone || !pinHash) return false;
     try {
-      // Update beta_users by phone_number
-      if (cleanPhone) {
-        await supabase
-          .from('beta_users')
-          .update({ pin_hash: pinHash })
-          .eq('phone_number', cleanPhone);
-      }
-
-      // Also try by id if it's a uuid
-      if (userIdOrPhone && userIdOrPhone !== cleanPhone) {
-        await supabase
-          .from('beta_users')
-          .update({ pin_hash: pinHash })
-          .eq('id', userIdOrPhone);
-      }
-
-      // Also sync bot_config for single-user backward compatibility if needed
-      await supabase
-        .from('bot_config')
-        .update({ pin: pinHash })
-        .gt('id', 0);
-
+      // Keep the user's PIN hash only on their beta profile; never mirror it into shared bot settings.
+      const { data: updated, error: updateError } = await supabase
+        .from('beta_users')
+        .update({ pin_hash: pinHash, updated_at: new Date().toISOString() })
+        .eq('phone_number', cleanPhone)
+        .select('phone_number')
+        .maybeSingle();
+      if (updateError) throw updateError;
+      if (!updated) return false;
       return true;
     } catch (err) {
       logger.error({ userIdOrPhone, err: err.message }, 'Failed to update user PIN');
@@ -119,13 +107,16 @@ export class UserContextService {
     if (!cleanPhone) return false;
 
     try {
-      const { error } = await supabase
+      const { data, error } = await supabase
         .from('beta_users')
         .update({ onboarding_step: step, updated_at: new Date().toISOString() })
-        .eq('phone_number', cleanPhone);
+        .eq('phone_number', cleanPhone)
+        .select('phone_number')
+        .maybeSingle();
 
-      if (error) {
-        logger.warn({ error: error.message, cleanPhone, step }, 'Failed to update onboarding step in DB');
+      if (error || !data) {
+        logger.warn({ error: error?.message, cleanPhone, step }, 'Failed to update onboarding step in DB');
+        return false;
       }
       return true;
     } catch (err) {
@@ -142,13 +133,16 @@ export class UserContextService {
     if (!cleanPhone || !displayName) return false;
 
     try {
-      const { error } = await supabase
+      const { data, error } = await supabase
         .from('beta_users')
         .update({ display_name: displayName, updated_at: new Date().toISOString() })
-        .eq('phone_number', cleanPhone);
+        .eq('phone_number', cleanPhone)
+        .select('phone_number')
+        .maybeSingle();
 
-      if (error) {
-        logger.warn({ error: error.message, cleanPhone, displayName }, 'Failed to update display name in DB');
+      if (error || !data) {
+        logger.warn({ error: error?.message, cleanPhone, displayName }, 'Failed to update display name in DB');
+        return false;
       }
       return true;
     } catch (err) {
@@ -164,7 +158,7 @@ export class UserContextService {
     if (!cleanPhone) return false;
 
     try {
-      await supabase
+      const { data, error } = await supabase
         .from('beta_users')
         .update({
           display_name: null,
@@ -172,7 +166,13 @@ export class UserContextService {
           onboarding_step: CONSTANTS.ONBOARDING_STEPS.AWAITING_NAME,
           updated_at: new Date().toISOString()
         })
-        .eq('phone_number', cleanPhone);
+        .eq('phone_number', cleanPhone)
+        .select('phone_number')
+        .maybeSingle();
+      if (error || !data) {
+        logger.warn({ cleanPhone, error: error?.message }, 'Failed to reset user onboarding in DB');
+        return false;
+      }
       return true;
     } catch (err) {
       logger.error({ cleanPhone, err: err.message }, 'Error resetting user onboarding');

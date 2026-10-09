@@ -8,11 +8,12 @@ import { billTransactionService } from '../services/billTransaction.js';
 import { PinService } from '../services/pin.js';
 import { userContextService } from './userContext.js';
 import { conversationMemory } from '../services/conversationMemory.js';
+import { PersistentSessionStore } from '../services/conversationSessions.js';
 import { CONSTANTS } from '../config/constants.js';
 import { logger } from '../lib/logger.js';
 
-// In-memory conversation state store with 5-minute TTL
-const pendingSessions = new Map();
+// Persist multi-turn state across server restarts, while keeping PIN material process-local.
+const pendingSessions = new PersistentSessionStore({ ttlMs: CONSTANTS.CONFIRMATION_TTL_MS });
 const billAuthChallenges = new Map();
 
 const MOBILE_NETWORKS = ['mtn', 'airtel', 'glo', '9mobile'];
@@ -47,6 +48,7 @@ function extractAmount(text) {
 
 function redactPersonalNumbers(text) {
   return String(text || '')
+    .replace(/\/api\/bill-auth\/[A-Za-z0-9_-]{40,60}/g, '/api/bill-auth/[REDACTED]')
     .replace(/\bpin(?:\s+is|\s*[:=])?\s*\d{4}\b/gi, 'PIN ****')
     .replace(/(?:\+?234[\s-]?[789](?:[\s-]?\d){9}|0[789](?:[\s-]?\d){9}|\b\d{10}\b)/g, value => `******${value.replace(/\D/g, '').slice(-4)}`);
 }
@@ -59,7 +61,7 @@ export class CommandHandler {
     const cleanTo = String(to).replace(/\D/g, '');
 
     // Persist assistant message in long-term conversation history
-    conversationMemory.recordMessage({
+    await conversationMemory.recordMessage({
       phone: cleanTo,
       role: 'assistant',
       content: redactPersonalNumbers(text),
@@ -88,6 +90,49 @@ export class CommandHandler {
     return false;
   }
 
+  restoreOnboardingSession(user) {
+    const onboardingStateByStep = {
+      [CONSTANTS.ONBOARDING_STEPS.AWAITING_NAME]: 'ONBOARDING_AWAITING_NAME',
+      [CONSTANTS.ONBOARDING_STEPS.SETTING_PIN_FIRST]: 'ONBOARDING_SETTING_PIN',
+      [CONSTANTS.ONBOARDING_STEPS.CONFIRMING_NEW_PIN]: 'ONBOARDING_SETTING_PIN',
+      [CONSTANTS.ONBOARDING_STEPS.OFFER_BENEFICIARY]: 'ONBOARDING_OFFER_BENEFICIARY',
+      [CONSTANTS.ONBOARDING_STEPS.AWAITING_BENEFICIARY_NICKNAME]: 'ONBOARDING_BENEFICIARY_NICKNAME',
+      [CONSTANTS.ONBOARDING_STEPS.AWAITING_BENEFICIARY_ACCOUNT]: 'ONBOARDING_BENEFICIARY_NICKNAME',
+      [CONSTANTS.ONBOARDING_STEPS.AWAITING_BENEFICIARY_BANK]: 'ONBOARDING_BENEFICIARY_NICKNAME',
+    };
+    const state = onboardingStateByStep[user?.onboarding_step];
+    if (!state) return null;
+
+    // The beneficiary's details and a PIN-confirmation candidate are not reconstructed from the profile row.
+    // Restart at the earliest step that can safely continue without missing or secret data.
+    if (state === 'ONBOARDING_BENEFICIARY_NICKNAME') {
+      userContextService.updateOnboardingStep(user.phone_number, CONSTANTS.ONBOARDING_STEPS.AWAITING_BENEFICIARY_NICKNAME).catch(() => {});
+    }
+    return {
+      state,
+      displayName: user.display_name || null,
+      timestamp: Date.now(),
+    };
+  }
+
+  async resumeOnboarding(from, user, session) {
+    const name = user.display_name ? `, ${user.display_name}` : '';
+    const prompts = {
+      ONBOARDING_SETTING_PIN: `Welcome back${name}. Please create a new 4-digit PIN to continue setup.`,
+      ONBOARDING_OFFER_BENEFICIARY: `Welcome back${name}. Your name and PIN are saved. Would you like to save a beneficiary now?`,
+      ONBOARDING_BENEFICIARY_NICKNAME: `Welcome back${name}. What nickname would you like to give the beneficiary?`,
+    };
+    const text = prompts[session.state] || 'Welcome back. Let’s continue setting up your account.';
+    if (session.state === 'ONBOARDING_OFFER_BENEFICIARY') {
+      await this.sendReply(from, text, [
+        { id: 'btn_beneficiary_yes', title: 'Yes, save one' },
+        { id: 'btn_beneficiary_skip', title: 'Skip for now' },
+      ]);
+      return;
+    }
+    await this.sendReply(from, text);
+  }
+
   /**
    * Main entry point for incoming WhatsApp messages
    */
@@ -107,7 +152,7 @@ export class CommandHandler {
 
     // Persist incoming user message into long-term conversation memory
     if (!isPotentialPin) {
-      conversationMemory.recordMessage({
+      await conversationMemory.recordMessage({
         phone: cleanFrom,
         role: 'user',
         content: redactPersonalNumbers(cleanText),
@@ -125,19 +170,42 @@ export class CommandHandler {
 
     const lower = cleanText.toLowerCase().trim();
 
-    // 2. Allow user to reset / restart onboarding anytime
-    if (['reset', 'restart', 'register', 'onboard', 'setup'].includes(lower)) {
+    // Restarting chat must never erase a user's saved name or PIN hash.
+    if (lower === 'restart') {
       pendingSessions.delete(cleanFrom);
-      await userContextService.resetUserOnboarding(cleanFrom);
-      user.display_name = null;
-      user.pin_hash = null;
-      user.onboarding_step = CONSTANTS.ONBOARDING_STEPS.AWAITING_NAME;
-      await this.handleOnboardingEntry(cleanFrom, cleanText, user);
+      if (this.isUserOnboarded(user)) {
+        await this.sendHomeMenu(cleanFrom, user);
+      } else {
+        const onboardingSession = this.restoreOnboardingSession(user);
+        if (onboardingSession) {
+          pendingSessions.set(cleanFrom, onboardingSession);
+          await this.resumeOnboarding(cleanFrom, user, onboardingSession);
+        } else {
+          await this.handleOnboardingEntry(cleanFrom, cleanText, user);
+        }
+      }
+      return;
+    }
+
+    // Account reset is destructive, so require an explicit confirmation.
+    if (['reset', 'reset account'].includes(lower)) {
+      pendingSessions.set(cleanFrom, { state: 'CONFIRM_ACCOUNT_RESET', timestamp: Date.now() });
+      await this.sendReply(cleanFrom, 'Reset your account setup? This permanently clears your saved name and PIN hash.', [
+        { id: 'btn_confirm_reset', title: 'Reset account' },
+        { id: 'btn_cancel_reset', title: 'Keep my account' },
+      ]);
       return;
     }
 
     // 3. Check for Active Multi-Step Session
-    const activeSession = pendingSessions.get(cleanFrom);
+    let activeSession = await pendingSessions.load(cleanFrom);
+    if (!activeSession && !this.isUserOnboarded(user)) {
+      activeSession = this.restoreOnboardingSession(user);
+      if (activeSession) {
+        pendingSessions.set(cleanFrom, activeSession);
+      }
+    }
+
     if (activeSession) {
       // Check session expiry (5 minutes)
       if (Date.now() - activeSession.timestamp > CONSTANTS.CONFIRMATION_TTL_MS) {
@@ -149,6 +217,25 @@ export class CommandHandler {
       // Check if session is an onboarding step
       if (activeSession.state && activeSession.state.startsWith('ONBOARDING_')) {
         await this.handleOnboardingSession(cleanFrom, cleanText, user, activeSession);
+        return;
+      }
+
+      if (activeSession.state === 'CONFIRM_ACCOUNT_RESET') {
+        if (['reset account', 'yes', 'confirm', '1', 'btn_confirm_reset'].includes(lower)) {
+          pendingSessions.delete(cleanFrom);
+          const reset = await userContextService.resetUserOnboarding(cleanFrom);
+          if (!reset) {
+            await this.sendReply(cleanFrom, 'I could not reset the account just now. Your saved profile was not intentionally changed; please try later.');
+            return;
+          }
+          user.display_name = null;
+          user.pin_hash = null;
+          user.onboarding_step = CONSTANTS.ONBOARDING_STEPS.AWAITING_NAME;
+          await this.handleOnboardingEntry(cleanFrom, cleanText, user);
+        } else {
+          pendingSessions.delete(cleanFrom);
+          await this.sendReply(cleanFrom, 'Your saved name and PIN are unchanged.');
+        }
         return;
       }
 
@@ -250,6 +337,9 @@ export class CommandHandler {
       default:
         // Use conversation memory for context-aware response
         const history = await conversationMemory.getRecentHistory(cleanFrom, 6);
+        if (history.at(-1)?.role === 'user' && history.at(-1).content === redactPersonalNumbers(cleanText)) {
+          history.pop();
+        }
         const response = await aiService.generateResponse(cleanText, '', history, user.display_name);
         await this.sendReply(cleanFrom, response);
         break;
@@ -859,7 +949,11 @@ export class CommandHandler {
       }
 
       const hash = await PinService.hashPin(text);
-      await userContextService.updateUserPin(from, hash);
+      const pinSaved = await userContextService.updateUserPin(from, hash);
+      if (!pinSaved) {
+        await this.sendReply(from, 'I could not securely save your PIN. No PIN has been activated; please try again in a moment.');
+        return;
+      }
       user.pin_hash = hash;
       delete session.newPinCandidate;
 
@@ -1317,11 +1411,15 @@ export class CommandHandler {
    * Fires for truly new users (no pin_hash and no onboarding_step).
    */
   async handleOnboardingEntry(from, text, user) {
+    const stepSaved = await userContextService.updateOnboardingStep(from, CONSTANTS.ONBOARDING_STEPS.AWAITING_NAME);
+    if (!stepSaved) {
+      await this.sendReply(from, 'I could not save your setup progress just now. Please try again in a moment.');
+      return;
+    }
     pendingSessions.set(from, {
       state: 'ONBOARDING_AWAITING_NAME',
       timestamp: Date.now(),
     });
-    await userContextService.updateOnboardingStep(from, CONSTANTS.ONBOARDING_STEPS.AWAITING_NAME);
 
     const welcomeMsg = `👋 Hello! Welcome to *GramPay*, your personal account manager on WhatsApp.\n\n` +
       `I make sending money to any Nigerian bank as fast and simple as sending a chat message.\n\n` +
@@ -1348,8 +1446,12 @@ export class CommandHandler {
       }
 
       const formattedName = rawName.charAt(0).toUpperCase() + rawName.slice(1);
-      await userContextService.updateDisplayName(from, formattedName);
-      await userContextService.updateOnboardingStep(from, CONSTANTS.ONBOARDING_STEPS.SETTING_PIN_FIRST);
+      const nameSaved = await userContextService.updateDisplayName(from, formattedName);
+      const stepSaved = nameSaved && await userContextService.updateOnboardingStep(from, CONSTANTS.ONBOARDING_STEPS.SETTING_PIN_FIRST);
+      if (!nameSaved || !stepSaved) {
+        await this.sendReply(from, 'I could not safely save your name and setup progress. Please try entering it again in a moment.');
+        return;
+      }
       user.display_name = formattedName;
 
       session.displayName = formattedName;

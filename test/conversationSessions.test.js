@@ -11,12 +11,8 @@ function fakeSupabase(seed = []) {
       let phone;
       return {
         upsert(row) {
-          return {
-            select() {
-              rows.set(row.phone_number, structuredClone(row));
-              return { single: async () => ({ data: row, error: null }) };
-            },
-          };
+          rows.set(row.phone_number, structuredClone(row));
+          return Promise.resolve({ data: row, error: null });
         },
         select() {
           return {
