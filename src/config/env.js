@@ -34,6 +34,7 @@ export const config = {
     secretKey: getEnv('FLW_SECRET_KEY', ''),
     publicKey: getEnv('FLW_PUBLIC_KEY', ''),
     webhookSecret: getEnv('FLW_WEBHOOK_SECRET', ''),
+    billPaymentsEnabled: getEnv('FLW_BILL_PAYMENTS_ENABLED', 'false').toLowerCase() === 'true',
   },
 
   groq: {

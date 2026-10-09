@@ -185,6 +185,23 @@ server/
 - Receipt generation
 - Multiple language support
 
+## Airtime and mobile data beta workflow
+
+The WhatsApp bot now supports an explicit airtime/data purchase flow backed by Flutterwave v3 bill payments. Airtime and data requests are parsed by deterministic code rather than the LLM. Users choose the network (it is never inferred from a phone prefix), review the exact number and current provider catalog price, confirm, and authorize with their PIN on a one-time HTTPS page. PINs are not requested in the bill-purchase chat flow or stored in conversation memory. Data plans are loaded live from Flutterwave and cached for five minutes.
+
+Before testing:
+
+1. Apply `supabase/migrations/20261009120000_airtime_data_purchases.sql` to the project database.
+2. Configure `FLW_BILL_PAYMENTS_ENABLED=true`, Flutterwave credentials, and `APP_URL` pointing to the public HTTPS API origin (required for the secure PIN page). Keep the flag `false` outside a controlled test until Flutterwave has enabled bill payments for the account.
+3. Confirm with Flutterwave whether bill payments are available with your test credentials. Their current documentation lists funded source balance and server-IP allowlisting as prerequisites. Do not test against a live float unless you intend to spend it.
+4. Restart/redeploy the API after changing environment variables.
+
+Example: send `buy airtime 500 MTN 08012345678`, or send `buy data` and follow the prompts. The flow also accepts `airtime`/`data` first and asks for missing details. After submission, use `status <reference>` to re-fetch the provider status. Pending and uncertain outcomes are not reported as successful or failed; a timeout is marked for review and must not be retried under a new reference.
+
+**Important current limitation:** this repository does not yet collect customer funds or maintain a customer wallet/ledger. Purchases debit the configured Flutterwave bill-payment float; the WhatsApp PIN and daily cap authorize/limit the test request but do not charge the user. Do not represent this as a customer-funded wallet or launch it commercially until funding, reconciliation, compliance, and legal structure are implemented and verified.
+
+Provider reference: [Flutterwave Bill Payments](https://developer.flutterwave.com/docs/bill-payment), [Create a bill payment](https://developer.flutterwave.com/reference/create-a-bill-payment), and [Get status of a bill payment](https://developer.flutterwave.com/reference/get-status-of-a-bill-payment).
+
 ## License
 
 Private use only - MVP version

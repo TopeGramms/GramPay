@@ -9,11 +9,13 @@ export class FlutterwavePaymentService {
   constructor() {
     this.secretKey = config.flutterwave.secretKey;
     this.webhookSecret = config.flutterwave.webhookSecret;
+    this.billPaymentsEnabled = config.flutterwave.billPaymentsEnabled;
     this.baseUrl = CONSTANTS.FLUTTERWAVE_BASE_URL;
     
     // In-memory cache for Nigerian bank list
     this.banksCache = null;
     this.banksCacheExpiry = 0;
+    this.billCatalogCache = new Map();
   }
 
   get headers() {
@@ -21,6 +23,125 @@ export class FlutterwavePaymentService {
       'Authorization': `Bearer ${this.secretKey}`,
       'Content-Type': 'application/json',
     };
+  }
+
+  async getBillCategories() {
+    return this.getCachedBillData('categories', async () => {
+      const response = await axios.get(`${this.baseUrl}/top-bill-categories`, {
+        headers: this.headers,
+        params: { country: 'NG' },
+        timeout: 15000,
+      });
+      if (response.data?.status !== 'success' || !Array.isArray(response.data?.data)) {
+        throw new PaymentError(response.data?.message || 'Could not load Flutterwave bill categories');
+      }
+      return response.data.data;
+    });
+  }
+
+  async getBillers(categoryCode) {
+    const cacheKey = `billers:${categoryCode}`;
+    return this.getCachedBillData(cacheKey, async () => {
+      const response = await axios.get(`${this.baseUrl}/bills/${encodeURIComponent(categoryCode)}/billers`, {
+        headers: this.headers,
+        params: { country: 'NG' },
+        timeout: 15000,
+      });
+      if (response.data?.status !== 'success' || !Array.isArray(response.data?.data)) {
+        throw new PaymentError(response.data?.message || 'Could not load mobile networks from Flutterwave');
+      }
+      return response.data.data;
+    });
+  }
+
+  async getBillItems(billerCode) {
+    const cacheKey = `items:${billerCode}`;
+    return this.getCachedBillData(cacheKey, async () => {
+      const response = await axios.get(`${this.baseUrl}/billers/${encodeURIComponent(billerCode)}/items`, {
+        headers: this.headers,
+        timeout: 15000,
+      });
+      if (response.data?.status !== 'success' || !Array.isArray(response.data?.data)) {
+        throw new PaymentError(response.data?.message || 'Could not load mobile plans from Flutterwave');
+      }
+      return response.data.data;
+    });
+  }
+
+  async getMobileBiller(product, network) {
+    const categories = await this.getBillCategories();
+    const categoryName = product === 'data' ? 'mobile data' : 'airtime';
+    const category = categories.find(item =>
+      `${item.code || ''} ${item.name || ''}`.toLowerCase().includes(categoryName)
+    );
+    if (!category?.code) throw new PaymentError(`Flutterwave does not list a ${product} category`);
+
+    const billers = await this.getBillers(category.code);
+    const aliases = {
+      mtn: ['mtn'],
+      airtel: ['airtel'],
+      glo: ['glo', 'globacom'],
+      '9mobile': ['9mobile', 'etisalat'],
+    }[network] || [network];
+    const biller = billers.find(item => {
+      const searchable = `${item.name || ''} ${item.short_name || ''} ${item.description || ''}`.toLowerCase();
+      return aliases.some(alias => searchable.includes(alias));
+    });
+    if (!biller?.biller_code) {
+      throw new PaymentError(`Flutterwave does not currently list ${network} for ${product}`);
+    }
+
+    const items = await this.getBillItems(biller.biller_code);
+    return { category, biller, items };
+  }
+
+  async createBillPayment({ billerCode, itemCode, customerPhone, amount, reference }) {
+    if (!config.flutterwave.billPaymentsEnabled) {
+      throw new PaymentError('Airtime and data purchases are disabled. Set FLW_BILL_PAYMENTS_ENABLED=true to enable testing.');
+    }
+    if (!this.secretKey) throw new PaymentError('Flutterwave secret key is not configured');
+    if (!billerCode || !itemCode || !customerPhone || !reference) {
+      throw new PaymentError('Required bill payment details are missing');
+    }
+
+    const appUrl = (process.env.APP_URL || 'https://grampay-3m3e.onrender.com').replace(/\/$/, '');
+    const response = await axios.post(
+      `${this.baseUrl}/billers/${encodeURIComponent(billerCode)}/items/${encodeURIComponent(itemCode)}/payment`,
+      {
+        country: 'NG',
+        customer_id: customerPhone,
+        amount: Number(amount),
+        reference,
+        callback_url: `${appUrl}/api/flutterwave/webhook`,
+      },
+      { headers: this.headers, timeout: 20000 },
+    );
+
+    if (response.data?.status !== 'success') {
+      throw new PaymentError(response.data?.message || 'Flutterwave did not accept the bill payment');
+    }
+    return response.data;
+  }
+
+  async getBillPaymentStatus(reference) {
+    if (!this.secretKey) throw new PaymentError('Flutterwave secret key is not configured');
+    const response = await axios.get(`${this.baseUrl}/bills/${encodeURIComponent(reference)}`, {
+      headers: this.headers,
+      params: { verbose: 1 },
+      timeout: 15000,
+    });
+    if (response.data?.status !== 'success' || !response.data?.data) {
+      throw new PaymentError(response.data?.message || 'Could not verify bill payment status');
+    }
+    return response.data.data;
+  }
+
+  async getCachedBillData(key, load) {
+    const cached = this.billCatalogCache.get(key);
+    if (cached && cached.expiresAt > Date.now()) return cached.data;
+    const data = await load();
+    this.billCatalogCache.set(key, { data, expiresAt: Date.now() + 5 * 60 * 1000 });
+    return data;
   }
 
   /**

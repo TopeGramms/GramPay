@@ -1,8 +1,10 @@
+import { randomBytes, randomUUID } from 'crypto';
 import { aiService } from '../services/ai.js';
 import { whatsappService } from '../services/whatsappCloud.js';
 import { paymentService } from '../services/payment.js';
 import { recipientService } from '../services/recipient.js';
 import { transactionService } from '../services/transaction.js';
+import { billTransactionService } from '../services/billTransaction.js';
 import { PinService } from '../services/pin.js';
 import { userContextService } from './userContext.js';
 import { conversationMemory } from '../services/conversationMemory.js';
@@ -11,6 +13,43 @@ import { logger } from '../lib/logger.js';
 
 // In-memory conversation state store with 5-minute TTL
 const pendingSessions = new Map();
+const billAuthChallenges = new Map();
+
+const MOBILE_NETWORKS = ['mtn', 'airtel', 'glo', '9mobile'];
+
+function normalizeNetwork(text) {
+  const lower = String(text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  if (/\b(9\s*mobile|etisalat)\b/.test(lower)) return '9mobile';
+  if (/\b(mtn)\b/.test(lower)) return 'mtn';
+  if (/\b(airtel)\b/.test(lower)) return 'airtel';
+  if (/\b(glo|globacom)\b/.test(lower)) return 'glo';
+  return null;
+}
+
+function normalizeNigerianPhone(text) {
+  const match = String(text || '').match(/(?:\+?234[\s-]?[789](?:[\s-]?\d){9}|0[789](?:[\s-]?\d){9}|[789](?:[\s-]?\d){9})/);
+  if (!match) return null;
+  const digits = match[0].replace(/\D/g, '');
+  if (digits.startsWith('234') && digits.length === 13) return `+${digits}`;
+  if (digits.startsWith('0') && digits.length === 11) return `+234${digits.slice(1)}`;
+  if (digits.length === 10) return `+234${digits}`;
+  return null;
+}
+
+function extractAmount(text) {
+  const withoutPhone = String(text || '').replace(/(?:\+?234[\s-]?[789](?:[\s-]?\d){9}|0[789](?:[\s-]?\d){9}|[789](?:[\s-]?\d){9})/g, ' ');
+  const match = withoutPhone.match(/(?:NGN|₦)?\s*(\d[\d,]*(?:\.\d{1,2})?)\s*(k|thousand)?\b/i);
+  if (!match) return null;
+  let amount = Number(match[1].replace(/,/g, ''));
+  if (/^(k|thousand)$/i.test(match[2] || '')) amount *= 1000;
+  return Number.isFinite(amount) ? amount : null;
+}
+
+function redactPersonalNumbers(text) {
+  return String(text || '')
+    .replace(/\bpin(?:\s+is|\s*[:=])?\s*\d{4}\b/gi, 'PIN ****')
+    .replace(/(?:\+?234[\s-]?[789](?:[\s-]?\d){9}|0[789](?:[\s-]?\d){9}|\b\d{10}\b)/g, value => `******${value.replace(/\D/g, '').slice(-4)}`);
+}
 
 export class CommandHandler {
   /**
@@ -23,7 +62,7 @@ export class CommandHandler {
     conversationMemory.recordMessage({
       phone: cleanTo,
       role: 'assistant',
-      content: text,
+      content: redactPersonalNumbers(text),
       metadata: buttons ? { buttons: buttons.map(b => b.title) } : {},
     }).catch(() => {});
 
@@ -63,15 +102,17 @@ export class CommandHandler {
     const cleanFrom = from.replace(/\D/g, '');
     const cleanText = text.trim();
     const isPotentialPin = /^\d{4}$/.test(cleanText);
-    const logText = isPotentialPin ? '****' : cleanText.replace(/\b\d{10}\b/g, (acc) => `******${acc.slice(-4)}`);
+    const logText = isPotentialPin ? '****' : redactPersonalNumbers(cleanText);
     logger.info({ from: cleanFrom, text: logText }, '📩 Processing incoming WhatsApp message');
 
     // Persist incoming user message into long-term conversation memory
-    conversationMemory.recordMessage({
-      phone: cleanFrom,
-      role: 'user',
-      content: cleanText,
-    }).catch(() => {});
+    if (!isPotentialPin) {
+      conversationMemory.recordMessage({
+        phone: cleanFrom,
+        role: 'user',
+        content: redactPersonalNumbers(cleanText),
+      }).catch(() => {});
+    }
 
     // 1. Resolve User Context
     const user = await userContextService.resolveUser(cleanFrom);
@@ -111,6 +152,11 @@ export class CommandHandler {
         return;
       }
 
+      if (activeSession.state?.startsWith('BILL_')) {
+        await this.handleBillSession(cleanFrom, cleanText, user, activeSession);
+        return;
+      }
+
       const recipients = await recipientService.getRecipients(user.id);
       await this.handleActiveSession(cleanFrom, cleanText, user, activeSession, messageId, recipients);
       return;
@@ -125,6 +171,18 @@ export class CommandHandler {
     // 5. Returning User Greeting Check (hi / hello / hey / start / menu)
     if (['hi', 'hello', 'hey', 'start', 'menu', 'home'].includes(lower)) {
       await this.sendHomeMenu(cleanFrom, user);
+      return;
+    }
+
+    const billStatusMatch = lower.match(/^(?:status|check status|check bill)\s+([a-z0-9_-]{8,80})$/i);
+    if (billStatusMatch) {
+      await this.handleBillStatus(cleanFrom, billStatusMatch[1]);
+      return;
+    }
+
+    if (/\b(airtime|mobile\s+data|data\s+bundle|buy\s+data)\b/i.test(lower)) {
+      const product = /\b(data|mobile\s+data|data\s+bundle)\b/i.test(lower) ? 'data' : 'airtime';
+      await this.startBillPurchase(cleanFrom, user, product, cleanText, messageId);
       return;
     }
 
@@ -198,6 +256,429 @@ export class CommandHandler {
     }
   }
 
+  async startBillPurchase(from, user, product, text, messageId) {
+    if (!paymentService.billPaymentsEnabled) {
+      await this.sendReply(from, 'Airtime and data purchases are currently disabled. For a sandbox test, configure FLW_BILL_PAYMENTS_ENABLED=true and apply the bill-purchases database migration first.');
+      return;
+    }
+
+    const session = {
+      kind: 'bill',
+      product,
+      customerPhone: normalizeNigerianPhone(text),
+      network: normalizeNetwork(text),
+      amount: product === 'airtime' ? extractAmount(text) : null,
+      state: 'BILL_STARTING',
+      timestamp: Date.now(),
+      idempotencyKey: `bill_${randomUUID()}`,
+      sourceMessageId: messageId || null,
+    };
+    pendingSessions.set(from, session);
+    await this.advanceBillPurchase(from, user, session);
+  }
+
+  async advanceBillPurchase(from, user, session) {
+    if (!session.customerPhone) {
+      session.state = 'BILL_AWAITING_PHONE';
+      session.timestamp = Date.now();
+      pendingSessions.set(from, session);
+      await this.sendReply(from, `What Nigerian phone number should receive the ${session.product}? Include the full number, e.g. 08012345678.`);
+      return;
+    }
+
+    if (!session.network) {
+      session.state = 'BILL_AWAITING_NETWORK';
+      session.timestamp = Date.now();
+      pendingSessions.set(from, session);
+      await this.sendReply(from, 'Which mobile network is this number on? Number prefixes can be misleading after number portability.', [
+        { id: 'bill_network_mtn', title: 'MTN' },
+        { id: 'bill_network_airtel', title: 'Airtel' },
+        { id: 'bill_network_glo', title: 'Glo' },
+      ]);
+      return;
+    }
+
+    if (session.product === 'airtime' && (!session.amount || session.amount <= 0)) {
+      session.state = 'BILL_AWAITING_AMOUNT';
+      session.timestamp = Date.now();
+      pendingSessions.set(from, session);
+      await this.sendReply(from, 'How much airtime would you like to buy? Enter an amount in naira.');
+      return;
+    }
+
+    try {
+      const catalog = await paymentService.getMobileBiller(session.product, session.network);
+      session.billerCode = catalog.biller.biller_code;
+      session.billerName = catalog.biller.name || catalog.biller.short_name || session.network.toUpperCase();
+
+      if (session.product === 'airtime') {
+        const airtimeItem = catalog.items.find(item => item.item_code && item.is_airtime === true && item.is_data !== true);
+        if (!airtimeItem?.item_code) throw new Error(`Flutterwave has no active airtime item for ${session.network}`);
+        session.itemCode = airtimeItem.item_code;
+        session.planName = 'Airtime top-up';
+        await this.prepareBillConfirmation(from, user, session, Number(airtimeItem.fee) || 0);
+        return;
+      }
+
+      const plans = catalog.items
+        .filter(item => item.item_code && Number(item.amount) > 0 && Number(item.amount) <= CONSTANTS.MAX_SINGLE_TRANSFER)
+        .sort((a, b) => Number(a.amount) - Number(b.amount))
+        .slice(0, 10);
+      if (!plans.length) throw new Error(`Flutterwave returned no priced data plans for ${session.network}`);
+
+      session.planOptions = plans.map(item => ({
+        itemCode: item.item_code,
+        name: item.short_name || item.name || item.item_code,
+        amount: Number(item.amount),
+        fee: Number(item.fee) || 0,
+      }));
+      session.state = 'BILL_AWAITING_DATA_PLAN';
+      session.timestamp = Date.now();
+      pendingSessions.set(from, session);
+
+      const planList = session.planOptions
+        .map((plan, index) => `${index + 1}. ${plan.name} — NGN ${plan.amount.toLocaleString()}${plan.fee ? ` (+ NGN ${plan.fee.toLocaleString()} provider fee)` : ''}`)
+        .join('\n');
+      await this.sendReply(from, `Available ${session.network.toUpperCase()} data plans for ${session.customerPhone}:\n\n${planList}\n\nReply with the plan number, or say cancel.`);
+    } catch (error) {
+      logger.warn({ product: session.product, network: session.network, error: error.message }, 'Mobile bill catalog lookup failed');
+      pendingSessions.delete(from);
+      await this.sendReply(from, `I could not load the current ${session.network.toUpperCase()} ${session.product} options from Flutterwave. No purchase was made. Please try again later.`);
+    }
+  }
+
+  async prepareBillConfirmation(from, user, session, providerFee = 0) {
+    const amount = Number(session.amount);
+    const totalDebit = amount + Number(providerFee || 0);
+    if (!Number.isInteger(amount) || amount < CONSTANTS.MIN_SINGLE_TRANSFER || amount > CONSTANTS.MAX_SINGLE_TRANSFER) {
+      pendingSessions.delete(from);
+      await this.sendReply(from, `Airtime must be a whole-naira amount between NGN ${CONSTANTS.MIN_SINGLE_TRANSFER.toLocaleString()} and NGN ${CONSTANTS.MAX_SINGLE_TRANSFER.toLocaleString()}.`);
+      return;
+    }
+
+    try {
+      const spentToday = await billTransactionService.getDailySpent(user.phone_number || from);
+      if (spentToday + totalDebit > Number(user.daily_limit)) {
+        pendingSessions.delete(from);
+        const remaining = Math.max(0, Number(user.daily_limit) - spentToday);
+        await this.sendReply(from, `This would exceed your daily limit. Remaining today: NGN ${remaining.toLocaleString()}.`);
+        return;
+      }
+    } catch (error) {
+      pendingSessions.delete(from);
+      await this.sendReply(from, error.message);
+      return;
+    }
+
+    session.providerFee = Number(providerFee) || 0;
+    session.state = 'BILL_AWAITING_CONFIRMATION';
+    session.timestamp = Date.now();
+    pendingSessions.set(from, session);
+    const label = session.product === 'data' ? session.planName : 'Airtime top-up';
+    const quote = `📱 *${session.product === 'data' ? 'Data purchase' : 'Airtime purchase'}*\n\n` +
+      `*Network:* ${session.network.toUpperCase()}\n` +
+      `*Number:* ${session.customerPhone}\n` +
+      `*Plan:* ${label}\n` +
+      `*Amount:* NGN ${amount.toLocaleString()}\n` +
+      (session.providerFee ? `*Provider fee:* NGN ${session.providerFee.toLocaleString()}\n` : '') +
+      `\nConfirm only if the network, number, and amount are correct. This beta purchase is paid from GramPay's Flutterwave bill-payment float; it does not debit a user wallet.`;
+    await this.sendReply(from, quote, [
+      { id: 'bill_confirm', title: 'Confirm' },
+      { id: 'bill_cancel', title: 'Cancel' },
+    ]);
+  }
+
+  async handleBillSession(from, text, user, session) {
+    const lower = text.toLowerCase().trim();
+    if (['no', 'cancel', 'stop', 'abort', 'dont', "don't", 'exit'].includes(lower)) {
+      pendingSessions.delete(from);
+      await this.sendReply(from, 'Purchase cancelled. No bill payment was submitted.');
+      return;
+    }
+
+    if (session.state === 'BILL_AWAITING_PHONE') {
+      const phone = normalizeNigerianPhone(text);
+      if (!phone) {
+        await this.sendReply(from, 'Please enter a valid Nigerian mobile number, such as 08012345678 or +2348012345678.');
+        return;
+      }
+      session.customerPhone = phone;
+      await this.advanceBillPurchase(from, user, session);
+      return;
+    }
+
+    if (session.state === 'BILL_AWAITING_NETWORK') {
+      const network = normalizeNetwork(text);
+      if (!network || !MOBILE_NETWORKS.includes(network)) {
+        await this.sendReply(from, 'Please specify MTN, Airtel, Glo, or 9mobile. We do not infer a network from the phone prefix.');
+        return;
+      }
+      session.network = network;
+      await this.advanceBillPurchase(from, user, session);
+      return;
+    }
+
+    if (session.state === 'BILL_AWAITING_AMOUNT') {
+      const amount = extractAmount(text);
+      if (!Number.isInteger(amount)) {
+        await this.sendReply(from, 'Please enter a whole-naira amount, for example 500 or 1,000.');
+        return;
+      }
+      session.amount = amount;
+      await this.advanceBillPurchase(from, user, session);
+      return;
+    }
+
+    if (session.state === 'BILL_AWAITING_DATA_PLAN') {
+      const choice = Number.parseInt(text, 10);
+      if (!Number.isInteger(choice) || choice < 1 || choice > session.planOptions.length) {
+        await this.sendReply(from, `Reply with a plan number from 1 to ${session.planOptions.length}, or say cancel.`);
+        return;
+      }
+      const plan = session.planOptions[choice - 1];
+      session.itemCode = plan.itemCode;
+      session.planName = plan.name;
+      session.amount = plan.amount;
+      await this.prepareBillConfirmation(from, user, session, plan.fee);
+      return;
+    }
+
+    if (session.state === 'BILL_AWAITING_CONFIRMATION') {
+      if (!['yes', 'confirm', 'proceed', 'ok', 'okay', '1'].includes(lower)) {
+        await this.sendReply(from, 'Please tap Confirm or reply YES to continue, or Cancel to stop.');
+        return;
+      }
+      if (!user.pin_hash) {
+        pendingSessions.delete(from);
+        await this.sendReply(from, 'A security PIN is required before bill purchases. Please finish account setup first; PIN setup and entry are not supported in WhatsApp chat for bill payments.');
+        return;
+      }
+      for (const [oldToken, challenge] of billAuthChallenges.entries()) {
+        if (challenge.expiresAt <= Date.now()) billAuthChallenges.delete(oldToken);
+      }
+      const token = randomBytes(32).toString('base64url');
+      billAuthChallenges.set(token, { phone: from, expiresAt: Date.now() + CONSTANTS.CONFIRMATION_TTL_MS, attempts: 0 });
+      session.billAuthToken = token;
+      session.state = 'BILL_AWAITING_SECURE_PIN';
+      session.timestamp = Date.now();
+      pendingSessions.set(from, session);
+      const appUrl = (process.env.APP_URL || 'https://grampay-3m3e.onrender.com').replace(/\/$/, '');
+      if (process.env.NODE_ENV === 'production' && !appUrl.startsWith('https://')) {
+        billAuthChallenges.delete(token);
+        pendingSessions.delete(from);
+        await this.sendReply(from, 'Secure authorization is unavailable right now. No purchase was submitted. Please contact support.');
+        return;
+      }
+      await this.sendReply(from, `🔒 Confirm securely in your browser. Your PIN is not requested or stored in this WhatsApp chat.\n\n${appUrl}/api/bill-auth/${token}\n\nThis one-time link expires in 5 minutes.`);
+      return;
+    }
+
+    if (session.state === 'BILL_AWAITING_SECURE_PIN') {
+      await this.sendReply(from, 'Please use the one-time secure authorization link to enter your PIN. Do not send your PIN in this chat.');
+      return;
+    }
+
+    await this.sendReply(from, 'This purchase step is not recognized. Please cancel and start again.');
+  }
+
+  async executeBillPurchase(from, user, session) {
+    await this.sendReply(from, '⏳ Submitting your purchase to Flutterwave…');
+    let transaction;
+    try {
+      const spentToday = await billTransactionService.getDailySpent(user.phone_number || from);
+      if (spentToday + Number(session.amount) + Number(session.providerFee || 0) > Number(user.daily_limit)) {
+        await this.sendReply(from, 'Your daily limit has been reached. No purchase was submitted.');
+        return;
+      }
+
+      transaction = await billTransactionService.createPurchase({
+        requesterPhone: user.phone_number || from,
+        product: session.product,
+        network: session.network,
+        customerPhone: session.customerPhone,
+        billerCode: session.billerCode,
+        itemCode: session.itemCode,
+        planName: session.planName,
+        amount: session.amount,
+        providerFee: session.providerFee,
+        reference: session.idempotencyKey,
+      });
+    } catch (error) {
+      logger.error({ error: error.message, reference: session.idempotencyKey }, 'Bill purchase initialization failed');
+      await this.sendReply(from, '❌ I could not safely initialize this purchase, so no provider request was made. Please start again later.');
+      return;
+    }
+
+    if (!transaction.isNew) {
+      await this.sendReply(from, `This purchase was already submitted and will not be sent again.\nStatus: ${transaction.status.toUpperCase()}\nReference: ${transaction.provider_reference}\nSend “status ${transaction.provider_reference}” to check it.`);
+      return;
+    }
+
+    try {
+      const response = await paymentService.createBillPayment({
+        billerCode: session.billerCode,
+        itemCode: session.itemCode,
+        customerPhone: session.customerPhone,
+        amount: session.amount,
+        reference: session.idempotencyKey,
+      });
+      const providerData = response.data || {};
+      if ((providerData.tx_ref && providerData.tx_ref !== session.idempotencyKey) ||
+          (providerData.amount !== undefined && Number(providerData.amount) !== Number(session.amount))) {
+        throw new Error('Flutterwave response did not match the saved purchase reference or amount');
+      }
+      await billTransactionService.updateStatus(session.idempotencyKey, 'pending', {
+        providerTransactionId: providerData.reference || providerData.tx_ref,
+        providerFee: Number.isFinite(Number(providerData.fee)) ? Number(providerData.fee) : session.providerFee,
+        providerResponse: {
+          status: response.status,
+          message: response.message,
+          data: {
+            tx_ref: providerData.tx_ref,
+            reference: providerData.reference,
+            batch_reference: providerData.batch_reference,
+            code: providerData.code,
+            fee: providerData.fee,
+          },
+        },
+      });
+      await this.sendReply(from, `⏳ Flutterwave accepted the request and is processing it. I will not treat it as complete until its status is verified.\n\nReference: ${session.idempotencyKey}\nSend “status ${session.idempotencyKey}” to check.`);
+    } catch (error) {
+      // A timeout can happen after Flutterwave accepted the request. Never retry with a new reference or tell the user it failed.
+      await billTransactionService.updateStatus(session.idempotencyKey, 'manual_review', {
+        errorReason: 'Provider outcome uncertain; status must be checked before any retry.',
+      });
+      logger.error({ reference: session.idempotencyKey, error: error.message }, 'Bill payment outcome uncertain; marked for review');
+      await this.sendReply(from, `⚠️ I could not confirm the provider result. Do not submit this purchase again yet. It has been marked for status review.\n\nReference: ${session.idempotencyKey}\nSend “status ${session.idempotencyKey}” to check.`);
+    }
+  }
+
+  async handleBillStatus(from, reference, { notify = true } = {}) {
+    let transaction;
+    try {
+      transaction = await billTransactionService.findByReference(reference, from);
+    } catch (error) {
+      if (notify) await this.sendReply(from, 'I could not retrieve that purchase right now. Please try again later.');
+      return null;
+    }
+    if (!transaction) {
+      if (notify) await this.sendReply(from, 'I could not find a bill purchase with that reference for your account.');
+      return null;
+    }
+    if (['completed', 'failed'].includes(transaction.status)) {
+      if (notify) await this.sendBillStatusReply(from, transaction);
+      return transaction;
+    }
+
+    try {
+      const providerData = await paymentService.getBillPaymentStatus(reference);
+      if (providerData.tx_ref && providerData.tx_ref !== reference) {
+        throw new Error('Flutterwave returned a different bill reference');
+      }
+      if (providerData.amount !== undefined && Number(providerData.amount) !== Number(transaction.amount)) {
+        throw new Error('Flutterwave amount did not match the saved purchase');
+      }
+
+      const rawStatus = String(providerData.status || providerData.payment_status || providerData.transaction_status || '').toLowerCase();
+      let status = 'manual_review';
+      if (['successful', 'success', 'completed', 'complete'].includes(rawStatus)) status = 'completed';
+      else if (['failed', 'failure', 'reversed', 'cancelled'].includes(rawStatus)) status = 'failed';
+      else if (['pending', 'processing', 'new', 'initiated'].includes(rawStatus)) status = 'pending';
+      else if (providerData.flw_ref && Number(providerData.amount) === Number(transaction.amount)) status = 'completed';
+
+      transaction = await billTransactionService.updateStatus(reference, status, {
+        providerTransactionId: providerData.flw_ref,
+        providerFee: Number.isFinite(Number(providerData.fee)) ? Number(providerData.fee) : undefined,
+        providerResponse: {
+          tx_ref: providerData.tx_ref,
+          amount: providerData.amount,
+          fee: providerData.fee,
+          flw_ref: providerData.flw_ref,
+          status: providerData.status,
+          extra: providerData.extra,
+          token: providerData.token,
+        },
+        errorReason: status === 'manual_review' ? 'Provider status response was inconclusive.' : undefined,
+      }) || transaction;
+    } catch (error) {
+      logger.warn({ reference, error: error.message }, 'Could not confirm Flutterwave bill status');
+      transaction = await billTransactionService.updateStatus(reference, 'manual_review', {
+        errorReason: 'Status lookup failed or provider details did not match the saved purchase.',
+      }) || transaction;
+    }
+
+    if (notify) await this.sendBillStatusReply(from, transaction);
+    return transaction;
+  }
+
+  isBillAuthorizationTokenActive(token) {
+    const challenge = billAuthChallenges.get(token);
+    if (!challenge || challenge.verifying) return false;
+    if (challenge.expiresAt <= Date.now()) {
+      billAuthChallenges.delete(token);
+      return false;
+    }
+    const session = pendingSessions.get(challenge.phone);
+    return session?.state === 'BILL_AWAITING_SECURE_PIN' && session.billAuthToken === token;
+  }
+
+  async authorizeBillPurchase(token, pin) {
+    const challenge = billAuthChallenges.get(token);
+    if (!this.isBillAuthorizationTokenActive(token)) return { ok: false, reason: 'invalid' };
+    if (!/^\d{4}$/.test(String(pin || ''))) return { ok: false, reason: 'invalid_pin_format' };
+
+    // Lock the one-time challenge during the asynchronous hash check to reject concurrent form submissions.
+    challenge.verifying = true;
+    let user;
+    let isValid = false;
+    try {
+      user = await userContextService.resolveUser(challenge.phone);
+      isValid = Boolean(user && user.status !== 'frozen' && user.pin_hash && await PinService.verifyPin(String(pin), user.pin_hash));
+    } catch (error) {
+      logger.warn({ phone: challenge.phone, error: error.message }, 'Secure bill authorization verification failed');
+      return { ok: false, reason: 'unavailable' };
+    } finally {
+      challenge.verifying = false;
+    }
+
+    if (challenge.expiresAt <= Date.now()) {
+      billAuthChallenges.delete(token);
+      return { ok: false, reason: 'invalid' };
+    }
+
+    if (!isValid) {
+      challenge.attempts += 1;
+      if (challenge.attempts >= 3) {
+        billAuthChallenges.delete(token);
+        pendingSessions.delete(challenge.phone);
+        await this.sendReply(challenge.phone, '🚫 Secure authorization failed too many times. The purchase was cancelled; nothing was submitted.');
+        return { ok: false, reason: 'locked' };
+      }
+      return { ok: false, reason: 'incorrect_pin' };
+    }
+
+    billAuthChallenges.delete(token);
+    const session = pendingSessions.get(challenge.phone);
+    if (!session || session.state !== 'BILL_AWAITING_SECURE_PIN' || session.billAuthToken !== token) {
+      return { ok: false, reason: 'invalid' };
+    }
+    delete session.billAuthToken;
+    pendingSessions.delete(challenge.phone);
+    await this.executeBillPurchase(challenge.phone, user, session);
+    return { ok: true };
+  }
+
+  async sendBillStatusReply(from, transaction) {
+    const statusText = {
+      completed: '✅ Purchase completed',
+      failed: '❌ Provider confirmed the purchase failed',
+      pending: '⏳ Purchase is still processing',
+      processing: '⏳ Purchase is processing',
+      manual_review: '⚠️ Status is not yet conclusive; it is marked for review',
+    }[transaction.status] || '⚠️ Purchase status requires review';
+    await this.sendReply(from, `${statusText}\n${transaction.product === 'data' ? `Plan: ${transaction.plan_name}\n` : ''}Network: ${transaction.network.toUpperCase()}\nNumber: ${transaction.customer_phone}\nAmount: NGN ${Number(transaction.amount).toLocaleString()}\nReference: ${transaction.provider_reference}`);
+  }
+
   /**
    * Guided Multi-Turn Conversation State Machine
    */
@@ -207,7 +688,7 @@ export class CommandHandler {
     // Global Cancel
     if (['no', 'cancel', 'stop', 'abort', 'don\'t', 'dont', 'exit'].includes(lower)) {
       pendingSessions.delete(from);
-      await this.sendReply(from, '❌ Transfer request cancelled.');
+      await this.sendReply(from, session.kind === 'bill' ? 'Purchase cancelled. No bill payment was submitted.' : '❌ Transfer request cancelled.');
       return;
     }
 
@@ -378,9 +859,19 @@ export class CommandHandler {
       }
 
       const hash = await PinService.hashPin(text);
-      await userContextService.updateUserPin(user.id, hash);
+      await userContextService.updateUserPin(from, hash);
       user.pin_hash = hash;
       delete session.newPinCandidate;
+
+      if (session.pendingBillAuthorization) {
+        delete session.pendingBillAuthorization;
+        session.state = 'BILL_AWAITING_PIN';
+        session.pinAttempts = 0;
+        session.timestamp = Date.now();
+        pendingSessions.set(from, session);
+        await this.sendReply(from, '✅ PIN created. To authorize this purchase, please enter your new 4-digit PIN once more.');
+        return;
+      }
 
       // If this session had an active transfer pending, execute it
       if (session.amount && (session.accountNumber || session.recipientName)) {
@@ -548,7 +1039,7 @@ export class CommandHandler {
       return;
     }
 
-    const spentToday = await transactionService.getUserDailySpent(user.id);
+    const spentToday = await transactionService.getUserDailySpent(user.phone_number || from);
     if (spentToday + session.amount > user.daily_limit) {
       pendingSessions.delete(from);
       const remaining = Math.max(0, user.daily_limit - spentToday);
@@ -612,7 +1103,7 @@ export class CommandHandler {
     let initialTx;
     try {
       initialTx = await transactionService.logTransaction({
-        userId: user.id,
+        userId: user.phone_number || from,
         recipientName: session.recipientName,
         accountNumber: session.accountNumber,
         bankName: session.bankName,
@@ -729,7 +1220,7 @@ export class CommandHandler {
    * Check user limits and daily spent
    */
   async handleCheckBalance(from, user) {
-    const spentToday = await transactionService.getUserDailySpent(user.id);
+    const spentToday = await transactionService.getUserDailySpent(user.phone_number || from);
     const remaining = Math.max(0, user.daily_limit - spentToday);
 
     const msg = `📊 *GramPay Account Limits*\n\n` +

@@ -8,6 +8,7 @@ import flutterwaveWebhookRoutes from './routes/flutterwaveWebhook.js';
 import recipientRoutes from './routes/recipients.js';
 import transactionRoutes from './routes/transactions.js';
 import configRoutes from './routes/config.js';
+import billAuthRoutes from './routes/billAuth.js';
 
 import { apiRateLimiter, webhookRateLimiter } from './middleware/rateLimiter.js';
 import { errorHandler } from './middleware/errorHandler.js';
@@ -52,6 +53,7 @@ export function createApp() {
   app.use(apiRateLimiter, recipientRoutes);
   app.use(apiRateLimiter, transactionRoutes);
   app.use(apiRateLimiter, configRoutes);
+  app.use(apiRateLimiter, billAuthRoutes);
 
   // 404 Route Handler
   app.use((req, res) => {

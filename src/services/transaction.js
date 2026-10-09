@@ -163,12 +163,13 @@ export class TransactionService {
     try {
       const today = new Date();
       today.setHours(0, 0, 0, 0);
+      const requesterPhone = String(userId || '').replace(/\D/g, '');
 
       const { data, error } = await supabase
         .from('transactions')
         .select('amount')
-        .eq('user_id', userId)
-        .in('status', ['pending', 'completed', 'successful'])
+        .eq('requester_phone', requesterPhone)
+        .in('status', ['pending', 'processing', 'completed', 'successful', 'manual_review'])
         .gte('created_at', today.toISOString());
 
       if (error) {
