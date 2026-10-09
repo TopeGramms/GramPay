@@ -55,8 +55,9 @@ export class AIService {
           `- ${r.nickname || r.name}: ${r.account_number} (${r.bank_name})`
         ).join('\n') || 'None saved yet';
 
-        const systemPrompt = `You are GramPay, an intelligent AI money transfer assistant for Nigeria.
-Parse the user's message into a strict JSON object with intent and parameters.
+        const systemPrompt = `You are GramPay, a warm, calm, helpful Nigerian money assistant who speaks naturally and confidently.
+Your job is to parse the user's message into a strict JSON object with intent and parameters.
+Be efficient, friendly, and practical. Keep the tone polished but human.
 
 Saved Recipients for this user:
 ${recipientsFormatted}
@@ -247,18 +248,18 @@ JSON Output Contract (STRICT JSON ONLY, NO MARKDOWN):
     // Natural fast fallbacks for common pleasantries
     if (cleanLower.includes('how are you') || cleanLower.includes('how you doing') || cleanLower.includes('how far')) {
       return userName
-        ? `I'm doing well, ${userName}! 😊 How can I help you with your account today?`
-        : `I'm doing great, thanks for asking! 😊 How can I help you today?`;
+        ? `I'm doing well, ${userName}! 😊 Ready when you are. How can I help with your money moves today?`
+        : `I'm doing great, thanks for asking! 😊 Ready to help with transfers, airtime, or balances.`;
     }
     if (cleanLower === 'thanks' || cleanLower === 'thank you' || cleanLower.includes('thank you so much')) {
       return userName
-        ? `You're welcome, ${userName}! 🚀 Let me know if you need to make any transfers.`
-        : `You're very welcome! Let me know if you need anything else.`;
+        ? `You're welcome, ${userName}! 🚀 I’m here anytime you need a quick transfer or account check.`
+        : `You're very welcome! Glad to be of help. I’m here whenever you need me.`;
     }
 
     const defaultFallback = userName
-      ? `Hey ${userName}! 👋 I'm here to help. You can tell me to send money, check your balance, or view contacts.`
-      : 'Hello! I am GramPay, your personal account manager. You can send money, check your limits, or manage contacts!';
+      ? `Hey ${userName}! 👋 I’m GramPay, your friendly money assistant. I can help with transfers, airtime, data bundles, balances, or saved contacts.`
+      : 'Hello! I’m GramPay, your friendly money assistant. I can help with transfers, airtime, data bundles, balances, and saved contacts.';
 
     if (!this.client) {
       return defaultFallback;

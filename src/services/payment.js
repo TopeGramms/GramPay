@@ -70,29 +70,63 @@ export class FlutterwavePaymentService {
 
   async getMobileBiller(product, network) {
     const categories = await this.getBillCategories();
-    const categoryName = product === 'data' ? 'mobile data' : 'airtime';
-    const category = categories.find(item =>
-      `${item.code || ''} ${item.name || ''}`.toLowerCase().includes(categoryName)
-    );
-    if (!category?.code) throw new PaymentError(`Flutterwave does not list a ${product} category`);
+    const categoryName = product === 'data' ? 'data' : 'airtime';
+    const categoryPattern = product === 'data'
+      ? /(mobile\s*data|data\s*(bundle|top[-\s]*up)|internet|data\s*top\s*up)/i
+      : /(airtime|top[-\s]*up|recharge|voucher)/i;
 
-    const billers = await this.getBillers(category.code);
+    const fallbackCategories = categories
+      .filter(item => {
+        const text = `${item.code || ''} ${item.name || ''} ${item.description || ''}`.toLowerCase();
+        return categoryPattern.test(text) || text.includes(categoryName);
+      });
+
+    const category = fallbackCategories[0] || categories.find(item => {
+      const text = `${item.code || ''} ${item.name || ''} ${item.description || ''}`.toLowerCase();
+      return text.includes(product === 'data' ? 'data' : 'airtime');
+    });
+
     const aliases = {
-      mtn: ['mtn'],
+      mtn: ['mtn', 'mtn nigeria', 'mtn nigeri'],
       airtel: ['airtel'],
       glo: ['glo', 'globacom'],
       '9mobile': ['9mobile', 'etisalat'],
     }[network] || [network];
-    const biller = billers.find(item => {
-      const searchable = `${item.name || ''} ${item.short_name || ''} ${item.description || ''}`.toLowerCase();
-      return aliases.some(alias => searchable.includes(alias));
-    });
+
+    const recordBiller = (billerList = []) => {
+      return billerList.find(item => {
+        const searchable = `${item.name || ''} ${item.short_name || ''} ${item.description || ''}`.toLowerCase();
+        return aliases.some(alias => searchable.includes(alias));
+      });
+    };
+
+    let billers = [];
+    if (category?.code) {
+      billers = await this.getBillers(category.code).catch(() => []);
+    }
+
+    let biller = recordBiller(billers);
+    if (!biller && categories.length) {
+      for (const candidate of categories) {
+        try {
+          const candidateBillers = await this.getBillers(candidate.code);
+          biller = recordBiller(candidateBillers);
+          if (biller?.biller_code) break;
+        } catch (error) {
+          logger.warn({ code: candidate.code, product, network, error: error.message }, 'Flutterwave biller category lookup failed; trying next category');
+        }
+      }
+    }
+
     if (!biller?.biller_code) {
-      throw new PaymentError(`Flutterwave does not currently list ${network} for ${product}`);
+      throw new PaymentError(`Flutterwave does not currently list ${network.toUpperCase()} for ${product}`);
     }
 
     const items = await this.getBillItems(biller.biller_code);
-    return { category, biller, items };
+    if (!Array.isArray(items) || items.length === 0) {
+      throw new PaymentError(`Flutterwave returned no active ${network.toUpperCase()} ${product} items`);
+    }
+    return { category: category || { code: 'unknown', name: `${product} billing` }, biller, items };
   }
 
   async createBillPayment({ billerCode, itemCode, customerPhone, amount, reference }) {

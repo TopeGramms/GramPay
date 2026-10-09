@@ -285,6 +285,14 @@ export class CommandHandler {
       );
       return;
     }
+    if (['buy airtime', '💰 buy airtime', 'btn_buy_airtime', 'airtime top up', 'top up airtime'].includes(lower)) {
+      await this.startBillPurchase(cleanFrom, user, 'airtime', cleanText, messageId);
+      return;
+    }
+    if (['buy data', '📶 buy data', 'btn_buy_data', 'data bundle', 'mobile data', 'buy data bundle'].includes(lower)) {
+      await this.startBillPurchase(cleanFrom, user, 'data', cleanText, messageId);
+      return;
+    }
     if (['check balance', '📊 check balance', 'btn_check_balance', 'balance'].includes(lower)) {
       await this.handleCheckBalance(cleanFrom, user);
       return;
@@ -1386,10 +1394,12 @@ export class CommandHandler {
    */
   async sendHomeMenu(from, user) {
     const name = user?.display_name ? ` ${user.display_name}` : '';
-    const msg = `Hello${name}! I'm GramPay, your personal account manager. I can help you with transfers, airtime, checking balance, and managing beneficiaries. How can I assist you today?`;
+    const msg = `Hello${name}! I'm GramPay, your friendly money manager. I can help with transfers, airtime, data bundles, balances, and your saved contacts. What would you like to do today?`;
 
     await this.sendReply(from, msg, [
       { id: 'btn_send_money', title: 'Send money' },
+      { id: 'btn_buy_airtime', title: 'Buy airtime' },
+      { id: 'btn_buy_data', title: 'Buy data' },
       { id: 'btn_check_balance', title: 'Check balance' },
       { id: 'btn_my_contacts', title: 'My contacts' },
     ]);
